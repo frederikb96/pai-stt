@@ -1,0 +1,9 @@
+{
+  "name": "PAI STT Indicator",
+  "description": "Status indicator for the pai-stt dictation daemon",
+  "uuid": "pai-stt@frederikb.github.com",
+  "version": 1,
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "url": "https://github.com/frederikb96/pai-stt",
+  "settings-schema": "org.gnome.shell.extensions.pai-stt"
+}

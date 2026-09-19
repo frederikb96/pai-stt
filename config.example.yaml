@@ -1,0 +1,10 @@
+# pai-stt Configuration
+
+log_level: info
+
+pai_cloud:
+  # Full wss:// URL of the PAI Cloud voice socket.
+  socket_url: wss://your-pai-cloud-host/api/voice/socket
+
+# Max seconds to wait for a finished transcription after stopping recording
+transcription_timeout: 120

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src/ tests/
+      - run: mypy src/
+      - run: python -m pytest tests/ -v
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check extension/extension.js
+      - run: node --check extension/prefs.js
+      - run: python3 -c "import json; json.load(open('extension/metadata.json'))"
+      - run: |
+          python3 -c "
+          import xml.dom.minidom
+          xml.dom.minidom.parse('extension/schemas/org.gnome.shell.extensions.pai-stt.gschema.xml')
+          "
