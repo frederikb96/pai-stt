@@ -1,23 +1,19 @@
 """Client for the PAI Cloud voice socket.
 
 Speaks the documented protocol for `GET /api/voice/socket`: the `hello` /
-`ready` handshake, the uplink gate and audio frames, and the downlink control
-messages a transport with no playback channel still needs to see (`ack`,
-`state`, `notice`, `clear`). See the backend's own protocol document for the
-full frame set and what each field means; this module does not repeat it.
+`ready` handshake, the uplink gate and audio frames, the liveness `ping`/
+`pong` pair, and the downlink messages a transport with no playback channel
+receives (`ack`, `state`, `notice`, `clear`, `transcript`). See the backend's
+own protocol document for the full frame set and what each field means; this
+module does not repeat it.
 
-Two things the protocol document leaves open, both unimplemented here rather
-than guessed at:
+Declaring `caps.audio_downlink: false` on `hello` is what makes the backend
+attach this bus to its transcription-only engine and route transcribed text
+back as `transcript` frames instead of trying to speak it — there is no
+separate opt-in.
 
-- How transcribed text reaches a transport whose `caps` declare no downlink
-  at all. The document defines a binary audio frame down and a `state`
-  message for phase changes, but no frame carrying transcript text.
-- What an uplink reply to the backend's liveness ping looks like. The
-  document says the backend "sends an application-level ping on a regular
-  cadence"; no up-message type for a reply appears in its frame tables.
-
-`_dispatch` logs anything it does not recognise rather than raising, so
-either arriving later degrades to a warning instead of a crash.
+`_dispatch` logs anything it does not recognise rather than raising, so a
+frame type added later degrades to a warning instead of a crash.
 """
 
 from __future__ import annotations
@@ -33,10 +29,8 @@ from pai_stt.framing import decode_down_frame, encode_up_frame
 
 logger = logging.getLogger("pai_stt.voice_client")
 
-# The transport identifier this client sends in `hello.transport`. The
-# protocol document's enum uses "voxscribe" for the Linux dictation client
-# regardless of which repository or package implements it.
-TRANSPORT_NAME = "voxscribe"
+# The transport identifier this client sends in `hello.transport`.
+TRANSPORT_NAME = "pai-stt"
 
 
 def _noop(*_args: Any) -> None:
@@ -47,7 +41,10 @@ def _noop(*_args: Any) -> None:
 class VoiceSocketCallbacks:
     """Handlers for the downlink messages this client dispatches.
 
-    Each defaults to a no-op so a caller only wires up what it needs.
+    Each defaults to a no-op so a caller only wires up what it needs. There
+    is no `on_ping` — a `ping` is answered with `pong` internally, since
+    liveness is this module's own concern, not something a caller can get
+    wrong by forgetting to reply.
     """
 
     on_ready: Callable[[dict[str, Any]], None] = _noop
@@ -56,6 +53,13 @@ class VoiceSocketCallbacks:
     on_notice: Callable[[dict[str, Any]], None] = _noop
     on_clear: Callable[[], None] = _noop
     on_audio: Callable[[int, bytes], None] = _noop
+    #: `text`, `is_final`, `seq` from a `transcript` down frame. The caller
+    #: renders every `is_final` segment it has seen, in `seq` order,
+    #: followed by the latest non-final one — the composition rule the
+    #: protocol document specifies, not something this client resolves on
+    #: the caller's behalf, since only the caller knows where the result
+    #: goes (clipboard, file, panel preview).
+    on_transcript: Callable[[str, bool, int], None] = _noop
 
 
 class VoiceSocketClient:
@@ -83,7 +87,7 @@ class VoiceSocketClient:
             "transport": TRANSPORT_NAME,
             # No audio downlink: this client only ever writes transcribed
             # text, never plays synthesised speech back.
-            "caps": {"downlink": False},
+            "caps": {"audio_downlink": False},
             "auth": self._token,
         }
         if resume_token:
@@ -99,9 +103,9 @@ class VoiceSocketClient:
                 ref, pcm = decode_down_frame(message)
                 self._callbacks.on_audio(ref, pcm)
             else:
-                self._dispatch(json.loads(message))
+                await self._dispatch(json.loads(message))
 
-    def _dispatch(self, msg: dict[str, Any]) -> None:
+    async def _dispatch(self, msg: dict[str, Any]) -> None:
         msg_type = msg.get("type")
         if msg_type == "ready":
             self._resume_token = msg.get("resume_token")
@@ -114,6 +118,13 @@ class VoiceSocketClient:
             self._callbacks.on_notice(msg)
         elif msg_type == "clear":
             self._callbacks.on_clear()
+        elif msg_type == "transcript":
+            self._callbacks.on_transcript(msg["text"], msg["is_final"], msg["seq"])
+        elif msg_type == "ping":
+            # Timestamp-free by design: the backend judges round-trip time
+            # server-side from when it sent the ping, not from anything
+            # this reply carries.
+            await self._send_json({"type": "pong"})
         else:
             logger.warning("Unhandled voice socket message: %s", msg_type)
 

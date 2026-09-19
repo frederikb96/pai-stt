@@ -7,12 +7,10 @@ STATUS, TOGGLE.
 
 Captures the microphone with pw-record and streams it to the PAI Cloud voice
 socket while a recording is open; emits DBus signals for the GNOME extension.
-
-Delivering the finished transcription to the clipboard and to a file depends
-on how the backend hands transcript text back to a client with no playback
-channel, which the protocol this daemon speaks does not yet define — see
-`voice_client` for exactly what is and is not implemented. `_on_transcript`
-below is where that delivery happens once it is.
+`_on_transcript` folds each `transcript` down frame into the take's
+assembled text and delivers it to the clipboard and to a file — see
+`voice_client` for the frame this is wired to and the composition rule it
+implements.
 """
 
 from __future__ import annotations
@@ -154,6 +152,8 @@ class PaiSttDaemon:
         self.shutdown_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
         self.current_text: str = ""
+        self._committed_segments: dict[int, str] = {}
+        self._partial_text: str = ""
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
 
@@ -229,6 +229,7 @@ class PaiSttDaemon:
             on_audio=lambda ref, pcm: logger.warning(
                 "Received downlink audio on a no-downlink transport"
             ),
+            on_transcript=self._on_transcript,
         )
 
     def _on_notice(self, msg: dict[str, Any]) -> None:
@@ -239,16 +240,28 @@ class PaiSttDaemon:
             f"notice[{msg.get('code')}]: {text}",
         )
 
-    def _on_transcript(self, text: str) -> None:
-        """Deliver a finished transcription — not yet wired to anything.
+    def _on_transcript(self, text: str, is_final: bool, seq: int) -> None:
+        """Fold one `transcript` frame into the take's assembled text.
 
-        The protocol this daemon speaks has no frame carrying transcript
-        text back to a client with no audio downlink. Whatever eventually
-        fills that gap should end by calling this.
+        Renders every `is_final` segment seen so far, in `seq` order,
+        followed by the latest non-final one — the composition rule the
+        protocol document specifies, mirroring the backend's own
+        `TakeLedger.assembled_text`.
         """
-        self.current_text = text
-        self._write_result_file(text)
-        self.emit_state("transcribing", text[-500:])
+        if is_final:
+            self._committed_segments[seq] = text
+            self._partial_text = ""
+        else:
+            self._partial_text = text
+        self.current_text = self._assembled_text()
+        self._write_result_file(self.current_text)
+        self.emit_state("recording", self.current_text[-500:])
+
+    def _assembled_text(self) -> str:
+        parts = [self._committed_segments[seq] for seq in sorted(self._committed_segments)]
+        if self._partial_text:
+            parts.append(self._partial_text)
+        return " ".join(part for part in parts if part)
 
     async def start_recording(self) -> tuple[bool, str]:
         if self.state != State.IDLE:
@@ -260,6 +273,8 @@ class PaiSttDaemon:
         self.play_sound(SOUND_START)
         self.emit_state("recording", "")
         self.current_text = ""
+        self._committed_segments = {}
+        self._partial_text = ""
         logger.info("Starting recording session")
 
         ensure_output_dir()
