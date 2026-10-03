@@ -128,11 +128,15 @@ class SilenceGate:
         floor_loud = self._auto and floor > AUTO_MAX_FLOOR_DB
 
         if not self._withholding:
-            # Auto mode only counts quiet once the floor is trustworthy and low: while it
-            # still sits at speech level, everything reads as "quiet relative to the floor".
-            ready = (not self._auto) or (history_ms >= FLOOR_MIN_HISTORY_MS and not floor_loud)
-            self._quiet_ms = self._quiet_ms + dur if lvl < closed and ready else 0.0
-            if self._enabled and allowed and self._quiet_ms >= QUIET_WINDOW_MS:
+            # In auto mode a frame must also sit below the loud-room ceiling to count as
+            # quiet: at the start of a take the floor IS the speech level, so the close
+            # threshold sits above it and the opening sentence would otherwise count.
+            quiet = lvl < closed and (not self._auto or lvl < AUTO_MAX_FLOOR_DB)
+            self._quiet_ms = self._quiet_ms + dur if quiet else 0.0
+            floor_trusted = (not self._auto) or (
+                history_ms >= FLOOR_MIN_HISTORY_MS and not floor_loud
+            )
+            if self._enabled and allowed and self._quiet_ms >= QUIET_WINDOW_MS and floor_trusted:
                 self._withholding = True
                 self._above_run_ms = 0.0
                 self._ring = []
