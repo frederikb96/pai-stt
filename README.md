@@ -31,8 +31,8 @@ pai-stt setup
 ```
 
 Edit `~/.config/pai-stt/config.yaml` and set `pai_cloud.socket_url` to your deployment's voice
-socket and `token_command` to a command that prints the bearer token (for example
-`secret get PAI_ANDROID_JWT`). The command runs for every recording and re-transcription; the
+socket and `token_command` to a command that prints the bearer token (for example a
+password-store lookup). The command runs for every recording and re-transcription; the
 token is never stored in the config file, the environment or the service unit.
 
 ## Usage
