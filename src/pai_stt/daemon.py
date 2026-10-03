@@ -29,7 +29,16 @@ from typing import Any, Optional
 import yaml
 
 from pai_stt.clipboard import clipboard_payload, copy_text
-from pai_stt.paths import CONFIG_FILE, OUTPUT_DIR, RESULT_SYMLINK, ensure_output_dir
+from pai_stt.device import default_mic, device_name
+from pai_stt.paths import (
+    CONFIG_FILE,
+    OUTPUT_DIR,
+    RECORDINGS_DIR,
+    RESULT_SYMLINK,
+    ensure_output_dir,
+)
+from pai_stt.recordings import RecordingWriter
+from pai_stt.silence_gate import Frame, SilenceGate
 from pai_stt.voice_client import VoiceSocketCallbacks, VoiceSocketClient
 
 try:
@@ -46,6 +55,13 @@ SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms of audio at 16kHz 16-bit mono
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "pai-stt.sock"
 TOKEN_ENV_VAR = "PAI_STT_TOKEN"
+
+# Capture keeps running this long after stop is pressed so the last syllable
+# still in the pipeline is not cut off.
+STOP_TAIL_S = 0.3
+
+# Config keys that have no built-in default; see config.example.yaml.
+REQUIRED_CONFIG = (("pai_cloud", "socket_url"), ("transcription_timeout",), ("silence_gate",))
 
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
 SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")
@@ -86,6 +102,17 @@ def load_config() -> dict[str, Any]:
     try:
         with open(CONFIG_FILE) as f:
             config: dict[str, Any] = yaml.safe_load(f)
+        for path in REQUIRED_CONFIG:
+            node: Any = config
+            for key in path:
+                if not isinstance(node, dict) or key not in node:
+                    print(
+                        f"[CONFIG] ERROR: missing {'.'.join(path)} in {CONFIG_FILE}; "
+                        "see config.example.yaml",
+                        flush=True,
+                    )
+                    sys.exit(1)
+                node = node[key]
         logger.info(f"Config loaded from {CONFIG_FILE}")
         return config
     except Exception as e:
@@ -152,8 +179,12 @@ class PaiSttDaemon:
         self.shutdown_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
         self.current_text: str = ""
-        self._committed_segments: dict[int, str] = {}
+        self._committed_segments: dict[int, tuple[Optional[int], str]] = {}
         self._partial_text: str = ""
+        self._take_id: Optional[str] = None
+        self._writer: Optional[RecordingWriter] = None
+        self._gate: Optional[SilenceGate] = None
+        self._uplink_ok = True
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
 
@@ -230,7 +261,12 @@ class PaiSttDaemon:
                 "Received downlink audio on a no-downlink transport"
             ),
             on_transcript=self._on_transcript,
+            on_closed=self._on_closed,
         )
+
+    def _on_closed(self) -> None:
+        logger.warning("Voice socket closed")
+        self._uplink_ok = False
 
     def _on_notice(self, msg: dict[str, Any]) -> None:
         severity = msg.get("severity", "info")
@@ -240,25 +276,39 @@ class PaiSttDaemon:
             f"notice[{msg.get('code')}]: {text}",
         )
 
-    def _on_transcript(self, text: str, is_final: bool, seq: int) -> None:
+    def _on_transcript(
+        self,
+        text: str,
+        is_final: bool,
+        seq: int,
+        end_sample: Optional[int] = None,
+        take_id: Optional[str] = None,
+    ) -> None:
         """Fold one `transcript` frame into the take's assembled text.
 
-        Renders every `is_final` segment seen so far, in `seq` order,
-        followed by the latest non-final one — the composition rule the
-        protocol document specifies, mirroring the backend's own
-        `TakeLedger.assembled_text`.
+        Renders every `is_final` segment seen so far, ordered by `end_sample`
+        (by `seq` for a frame that carries none), followed by the latest
+        non-final one — the composition rule the protocol document
+        specifies, mirroring the backend's own `TakeLedger.assembled_text`.
+        Frames for another take are dropped.
         """
+        if take_id is not None and self._take_id is not None and take_id != self._take_id:
+            return
         if is_final:
-            self._committed_segments[seq] = text
+            self._committed_segments[seq] = (end_sample, text)
             self._partial_text = ""
         else:
             self._partial_text = text
         self.current_text = self._assembled_text()
         self._write_result_file(self.current_text)
-        self.emit_state("recording", self.current_text[-500:])
+        self.emit_state(self.state.value, self.current_text[-500:])
 
     def _assembled_text(self) -> str:
-        parts = [self._committed_segments[seq] for seq in sorted(self._committed_segments)]
+        ordered = sorted(
+            self._committed_segments.items(),
+            key=lambda item: (item[1][0] if item[1][0] is not None else item[0], item[0]),
+        )
+        parts = [text for _, (_, text) in ordered]
         if self._partial_text:
             parts.append(self._partial_text)
         return " ".join(part for part in parts if part)
@@ -275,6 +325,7 @@ class PaiSttDaemon:
         self.current_text = ""
         self._committed_segments = {}
         self._partial_text = ""
+        self._take_id = None
         logger.info("Starting recording session")
 
         ensure_output_dir()
@@ -285,7 +336,21 @@ class PaiSttDaemon:
         RESULT_SYMLINK.symlink_to(self.current_output_file)
 
         url = self.config["pai_cloud"]["socket_url"]
-        self.voice = VoiceSocketClient(url, self.token, self._voice_callbacks())
+        gate_config = self.config["silence_gate"]
+        self._gate = SilenceGate(
+            enabled=gate_config["enabled"],
+            mode=gate_config["mode"],
+            manual_threshold_db=gate_config["manual_threshold_db"],
+        )
+        self._uplink_ok = True
+        self.voice = VoiceSocketClient(
+            url,
+            self.token,
+            self._voice_callbacks(),
+            device_name=device_name(),
+            mic=default_mic(),
+            silence_gate=gate_config["enabled"],
+        )
         try:
             await self.voice.connect()
         except Exception as e:
@@ -317,25 +382,58 @@ class PaiSttDaemon:
             self.state = State.IDLE
             return False, f"Failed to start audio capture: {e}"
 
-        await self.voice.open_gate(reason="button")
+        self._take_id = await self.voice.open_gate(reason="button")
+        self._writer = RecordingWriter(RECORDINGS_DIR, self._take_id)
         self.pump_task = asyncio.create_task(self._pump_audio())
         return True, "Recording started"
 
     async def _pump_audio(self) -> None:
-        """Read pw-record's stdout and forward it as uplink audio frames."""
+        """Read pw-record's stdout to EOF; record every chunk, send what the gate lets through."""
         assert self.pw_record_proc is not None
         assert self.pw_record_proc.stdout is not None
-        assert self.voice is not None
+        stdout = self.pw_record_proc.stdout
         sample_offset = 0
         try:
-            while self.state == State.RECORDING:
-                chunk = await self.pw_record_proc.stdout.read(CHUNK_BYTES)
-                if not chunk:
+            while True:
+                last = False
+                try:
+                    chunk = await stdout.readexactly(CHUNK_BYTES)
+                except asyncio.IncompleteReadError as e:
+                    chunk = e.partial[: len(e.partial) // 2 * 2]
+                    last = True
+                if chunk:
+                    frame = Frame(sample_offset, chunk)
+                    sample_offset = frame.end
+                    if self._writer:
+                        self._writer.append(chunk)
+                    await self._feed(frame)
+                if last:
                     break
-                await self.voice.send_audio(sample_offset, chunk)
-                sample_offset += len(chunk) // 2
         except Exception as e:
             logger.error(f"Audio pump failed: {e}")
+
+    async def _feed(self, frame: Frame) -> None:
+        """Pass one captured frame through the gate and onto the wire."""
+        assert self._gate is not None and self.voice is not None
+        was_withholding = self._gate.is_withholding
+        result = self._gate.push(frame, self.voice.silence_allowed)
+        if result.silence_at is not None:
+            logger.info(f"gate withhold at_sample={result.silence_at}")
+        elif was_withholding and result.send:
+            logger.info(f"gate resume preroll_frames={len(result.send)}")
+        await self._send(result.send, result.silence_at)
+
+    async def _send(self, frames: list[Frame], silence_at: Optional[int] = None) -> None:
+        if not self._uplink_ok or self.voice is None:
+            return
+        try:
+            for frame in frames:
+                await self.voice.send_audio(frame.offset, frame.pcm)
+            if silence_at is not None:
+                await self.voice.send_silence(silence_at)
+        except Exception as e:
+            logger.error(f"Uplink failed, recording continues locally: {e}")
+            self._uplink_ok = False
 
     async def _terminate_pw_record(self) -> None:
         if not self.pw_record_proc:
@@ -363,25 +461,45 @@ class PaiSttDaemon:
         self.emit_state("transcribing", "")
         logger.info("Stopping recording session")
 
+        # Tail, drain, close the gate, wait for the receipt: capture runs a
+        # little past the button press, the pump reads pw-record to EOF so no
+        # captured sample is dropped, and `take_done` says nothing more is coming.
+        await asyncio.sleep(STOP_TAIL_S)
         await self._terminate_pw_record()
         if self.pump_task:
             await self.pump_task
             self.pump_task = None
 
-        if self.voice:
+        take_id = self._take_id
+        ended: Optional[str] = None
+        if self.voice and take_id:
+            if self._gate:
+                await self._send(self._gate.stop_flush())
             try:
                 await self.voice.close_gate(reason="button")
+                done = await self.voice.wait_take_done(
+                    take_id, float(self.config["transcription_timeout"])
+                )
+                ended = done.ended if done else None
+                logger.info(f"take_done ended={ended}")
                 await self.voice.bye(reason="stop")
             except Exception as e:
                 logger.warning(f"Voice socket shutdown was not clean: {e}")
             await self.voice.close()
             self.voice = None
 
+        complete = ended is not None and ended != "unavailable"
+        if self._writer:
+            self._writer.finish(self.current_text, complete)
+            self._writer = None
+
         if self.current_text:
+            await self.copy_to_clipboard(self.current_text)
+        if self.current_text and complete:
             self.play_sound(SOUND_DONE)
             self.emit_state("done", self.current_text[-500:])
         else:
-            self.emit_state("partial", "")
+            self.emit_state("partial", self.current_text[-500:])
         self.state = State.IDLE
         return True, "Recording stopped"
 

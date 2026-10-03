@@ -9,7 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ### Added
 
-- Voice socket client speaking the PAI Cloud protocol's hello/gate/audio handshake, the
+- Silence gate (auto or manual threshold, one-second pre-roll), announced to the backend with
+  `silence`; `caps.silence_gate` on `hello`.
+- Device identification on `hello` (hostname and the default PipeWire source).
+- Past recordings on disk with rotation, and the `recordings`, `transcript` and `retranscribe`
+  commands.
+- The `take_done` receipt; stop waits for it (`transcription_timeout`, default 30 s) and the
+  daemon copies the finished text to the clipboard.
+- GNOME indicator: the panel label ellipsizes from the start, so the live line shows the end of
+  the transcript.
+
+- Voice socket client reading the connection for its whole life, so the liveness ping is answered,
+  speaking the PAI Cloud protocol's hello/gate/audio handshake, the
   `ping`/`pong` liveness pair, and downlink control messages including `transcript`.
 - Daemon: microphone capture via PipeWire, DBus service for the GNOME extension, Unix socket
   command interface, transcript composition (committed segments in order, plus the latest partial).

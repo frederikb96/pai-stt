@@ -14,7 +14,11 @@ worth reading and reusing, and because a public repository gets unmetered CI.
 **Features:**
 - Stream microphone audio to a PAI Cloud voice socket while recording
 - Automatic clipboard copy on completion, verified by reading the clipboard back
-- GNOME panel indicator with full-text popup
+- GNOME panel indicator with full-text popup; the live line always shows the end of the transcript
+- Client-side silence gate: after a quiet stretch audio stops being sent (the backend keeps the
+  session open); the last second is sent first when speech resumes. Auto mode adapts to the room.
+- Stop waits for the backend's receipt that the take is finished, so the last words arrive
+- Past recordings on disk (newest 10) with commands to list, print and re-transcribe them
 - No local speech-to-text credentials — authentication is a single bearer token for the backend
 
 ## Installation
@@ -37,7 +41,14 @@ pai-stt toggle    # Start/stop recording (bind this to a keyboard shortcut)
 pai-stt status    # Check if daemon is running
 pai-stt start     # Start recording
 pai-stt stop      # Stop recording
+
+pai-stt recordings               # List past recordings, newest first
+pai-stt transcript <id|last>     # Print a past recording's transcript
+pai-stt retranscribe <id|last>   # Transcribe a past recording again via the backend
 ```
+
+Recordings live in `~/.local/share/pai-stt/recordings/` as a 16 kHz WAV plus a JSON sidecar
+each; an id is the full take id or any unique prefix.
 
 **Output:**
 - Clipboard: `stt-rec: <transcription>`
@@ -64,7 +75,9 @@ path delivered it.
 
 ## Configuration
 
-Edit `~/.config/pai-stt/config.yaml`; all options with defaults are in `config.example.yaml`.
+Edit `~/.config/pai-stt/config.yaml`; all options are in `config.example.yaml`, including the
+`silence_gate` block (on, auto by default; `manual` uses a fixed threshold in dBFS). A missing
+option stops the daemon with a message naming it.
 
 ## Uninstall
 
