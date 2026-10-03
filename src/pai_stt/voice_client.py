@@ -199,9 +199,10 @@ class VoiceSocketClient:
     def _take_future(self, take_id: str) -> asyncio.Future[Optional[TakeDone]]:
         return self._take_futures.setdefault(take_id, asyncio.get_running_loop().create_future())
 
-    async def open_gate(self, reason: str) -> str:
-        """Start a take: returns the `take_id` minted for it. Resets the frame counter."""
-        take_id = str(uuid.uuid4())
+    async def open_gate(self, reason: str, take_id: Optional[str] = None) -> str:
+        """Start a take and return its `take_id`, minted here unless the caller already holds
+        one. Resets the frame counter."""
+        take_id = take_id or str(uuid.uuid4())
         self._take_future(take_id)
         await self._send_json({"type": "gate", "open": True, "reason": reason, "take_id": take_id})
         self._seq = 0

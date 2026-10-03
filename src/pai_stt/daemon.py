@@ -21,13 +21,15 @@ import os
 import signal
 import socket as socket_module
 import sys
+import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 
+from pai_stt.bearer import TokenError, resolve_token
 from pai_stt.clipboard import clipboard_payload, copy_text
 from pai_stt.device import default_mic, device_name
 from pai_stt.paths import (
@@ -54,14 +56,23 @@ except ImportError:
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms of audio at 16kHz 16-bit mono
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "pai-stt.sock"
-TOKEN_ENV_VAR = "PAI_STT_TOKEN"
 
 # Capture keeps running this long after stop is pressed so the last syllable
 # still in the pipeline is not cut off.
 STOP_TAIL_S = 0.3
 
 # Config keys that have no built-in default; see config.example.yaml.
-REQUIRED_CONFIG = (("pai_cloud", "socket_url"), ("transcription_timeout",), ("silence_gate",))
+REQUIRED_CONFIG = (
+    ("pai_cloud", "socket_url"),
+    ("token_command",),
+    ("transcription_timeout",),
+    ("silence_gate",),
+)
+
+# What stop adds to `transcription_timeout` in the worst case: the tail, the pw-record
+# terminate/kill waits, and the gate close, bye and socket close around the receipt wait.
+STOP_OVERHEAD_S = 15.0
+DEFAULT_COMMAND_TIMEOUT_S = 15.0
 
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
 SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")
@@ -172,7 +183,6 @@ class PaiSttDaemon:
     def __init__(self, config: dict[str, Any]) -> None:
         self.state = State.IDLE
         self.config = config
-        self.token: str = ""
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
         self.pump_task: Optional[asyncio.Task[None]] = None
         self.voice: Optional[VoiceSocketClient] = None
@@ -185,16 +195,11 @@ class PaiSttDaemon:
         self._writer: Optional[RecordingWriter] = None
         self._gate: Optional[SilenceGate] = None
         self._uplink_ok = True
+        self._uplink_ready = False
+        self._connect_task: Optional[asyncio.Task[None]] = None
+        self._pending: list[Frame] = []
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
-
-    def load_token(self) -> bool:
-        """Load the PAI Cloud bearer token from the environment."""
-        self.token = os.environ.get(TOKEN_ENV_VAR, "")
-        if self.token:
-            return True
-        logger.error(f"{TOKEN_ENV_VAR} environment variable not set")
-        return False
 
     async def setup_dbus(self) -> None:
         """Set up the DBus service the GNOME extension talks to."""
@@ -316,16 +321,22 @@ class PaiSttDaemon:
     async def start_recording(self) -> tuple[bool, str]:
         if self.state != State.IDLE:
             return False, f"Cannot start: state is {self.state.value}"
-        if not self.token and not self.load_token():
-            return False, f"{TOKEN_ENV_VAR} not set"
-
+        # Claim the state before the first await so a second START cannot slip in.
         self.state = State.RECORDING
+        try:
+            token = await asyncio.to_thread(resolve_token, self.config)
+        except TokenError as e:
+            logger.error(f"No bearer token: {e}")
+            self.play_sound(SOUND_ERROR)
+            self.state = State.IDLE
+            return False, f"No bearer token: {e}"
+
         self.play_sound(SOUND_START)
         self.emit_state("recording", "")
         self.current_text = ""
         self._committed_segments = {}
         self._partial_text = ""
-        self._take_id = None
+        self._take_id = str(uuid.uuid4())
         logger.info("Starting recording session")
 
         ensure_output_dir()
@@ -335,7 +346,6 @@ class PaiSttDaemon:
         RESULT_SYMLINK.unlink(missing_ok=True)
         RESULT_SYMLINK.symlink_to(self.current_output_file)
 
-        url = self.config["pai_cloud"]["socket_url"]
         gate_config = self.config["silence_gate"]
         self._gate = SilenceGate(
             enabled=gate_config["enabled"],
@@ -343,23 +353,19 @@ class PaiSttDaemon:
             manual_threshold_db=gate_config["manual_threshold_db"],
         )
         self._uplink_ok = True
+        self._uplink_ready = False
+        self._pending = []
         self.voice = VoiceSocketClient(
-            url,
-            self.token,
+            self.config["pai_cloud"]["socket_url"],
+            token,
             self._voice_callbacks(),
             device_name=device_name(),
             mic=default_mic(),
             silence_gate=gate_config["enabled"],
         )
-        try:
-            await self.voice.connect()
-        except Exception as e:
-            logger.error(f"Voice socket connect failed: {e}")
-            self.play_sound(SOUND_ERROR)
-            self.emit_state("error", "")
-            self.state = State.IDLE
-            return False, f"Voice socket connect failed: {e}"
 
+        # Capture and the local recording start first; the connection is made in
+        # parallel and the frames captured meanwhile are flushed once it is ready.
         try:
             self.pw_record_proc = await asyncio.create_subprocess_exec(
                 "pw-record",
@@ -376,16 +382,43 @@ class PaiSttDaemon:
             logger.info(f"pw-record started (PID {self.pw_record_proc.pid})")
         except Exception as e:
             logger.error(f"Failed to start pw-record: {e}")
-            await self.voice.close()
             self.play_sound(SOUND_ERROR)
             self.emit_state("error", "")
+            self.voice = None
             self.state = State.IDLE
             return False, f"Failed to start audio capture: {e}"
 
-        self._take_id = await self.voice.open_gate(reason="button")
         self._writer = RecordingWriter(RECORDINGS_DIR, self._take_id)
+        self._connect_task = asyncio.create_task(self._connect_uplink(self.voice, self._take_id))
         self.pump_task = asyncio.create_task(self._pump_audio())
         return True, "Recording started"
+
+    async def _connect_uplink(self, voice: VoiceSocketClient, take_id: str) -> None:
+        """Connect and open the gate; on failure the local recording carries on alone."""
+        try:
+            await voice.connect()
+            await voice.open_gate(reason="button", take_id=take_id)
+        except Exception as e:
+            logger.error(f"Voice socket connect failed, recording continues locally: {e}")
+            self._uplink_ok = False
+            self._pending = []
+            self.play_sound(SOUND_ERROR)
+            try:
+                await voice.close()
+            except Exception as close_error:
+                logger.debug(f"Closing the failed voice socket: {close_error}")
+            return
+        self._uplink_ready = True
+
+    async def _drain_pending(self) -> None:
+        """Send the frames captured so far, in order, once the uplink is ready."""
+        if not self._uplink_ok:
+            self._pending = []
+            return
+        if not self._uplink_ready:
+            return
+        while self._pending:
+            await self._feed(self._pending.pop(0))
 
     async def _pump_audio(self) -> None:
         """Read pw-record's stdout to EOF; record every chunk, send what the gate lets through."""
@@ -406,7 +439,8 @@ class PaiSttDaemon:
                     sample_offset = frame.end
                     if self._writer:
                         self._writer.append(chunk)
-                    await self._feed(frame)
+                    self._pending.append(frame)
+                    await self._drain_pending()
                 if last:
                     break
         except Exception as e:
@@ -470,9 +504,14 @@ class PaiSttDaemon:
             await self.pump_task
             self.pump_task = None
 
+        if self._connect_task:
+            await self._connect_task
+            self._connect_task = None
+            await self._drain_pending()
+
         take_id = self._take_id
         ended: Optional[str] = None
-        if self.voice and take_id:
+        if self.voice and take_id and self._uplink_ready:
             if self._gate:
                 await self._send(self._gate.stop_flush())
             try:
@@ -486,7 +525,8 @@ class PaiSttDaemon:
             except Exception as e:
                 logger.warning(f"Voice socket shutdown was not clean: {e}")
             await self.voice.close()
-            self.voice = None
+        self.voice = None
+        self._uplink_ready = False
 
         complete = ended is not None and ended != "unavailable"
         if self._writer:
@@ -541,9 +581,13 @@ async def _serve_command(daemon: PaiSttDaemon, reader: Any, writer: Any) -> None
     command = data.decode().strip()
     logger.info(f"Received command: {command}")
     reply = await daemon.handle_command(command)
-    writer.write(f"{reply}\n".encode())
-    await writer.drain()
-    writer.close()
+    try:
+        writer.write(f"{reply}\n".encode())
+        await writer.drain()
+    except ConnectionError:
+        logger.warning("Command client went away before the reply was written")
+    finally:
+        writer.close()
 
 
 async def run_daemon() -> None:
@@ -552,7 +596,6 @@ async def run_daemon() -> None:
     logger.info("pai-stt daemon starting")
 
     daemon = PaiSttDaemon(config)
-    daemon.load_token()
     await daemon.setup_dbus()
 
     SOCKET_PATH.unlink(missing_ok=True)
@@ -571,7 +614,17 @@ async def run_daemon() -> None:
     SOCKET_PATH.unlink(missing_ok=True)
 
 
-def send_command(command: str, timeout: float = 15) -> str:
+def command_timeout(command: str, load: Callable[[], dict[str, Any]]) -> float:
+    """Seconds a CLI waits for the daemon's reply: a stop outlasts the transcription wait.
+
+    `load` reads the config, so only a command that can stop a take needs one.
+    """
+    if command.lower() in ("stop", "toggle"):
+        return float(load()["transcription_timeout"]) + STOP_OVERHEAD_S
+    return DEFAULT_COMMAND_TIMEOUT_S
+
+
+def send_command(command: str, timeout: float = DEFAULT_COMMAND_TIMEOUT_S) -> str:
     """Send a command to a running daemon over the Unix socket. CLI-side helper."""
     with socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM) as sock:
         sock.settimeout(timeout)

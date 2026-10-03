@@ -16,7 +16,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from datetime import datetime
@@ -24,7 +23,8 @@ from pathlib import Path
 from typing import NoReturn
 
 from pai_stt import batch, recordings
-from pai_stt.daemon import TOKEN_ENV_VAR, load_config, send_command
+from pai_stt.bearer import TokenError, resolve_token
+from pai_stt.daemon import command_timeout, load_config, send_command
 from pai_stt.paths import CONFIG_DIR, CONFIG_FILE, RECORDINGS_DIR
 
 SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
@@ -38,6 +38,10 @@ log_level: info
 pai_cloud:
   # Full wss:// URL of the PAI Cloud voice socket.
   socket_url: wss://your-pai-cloud-host/api/voice/socket
+
+# Command printing the bearer token on stdout, run for every recording and
+# re-transcription; the token is never stored or logged.
+token_command: "secret get PAI_ANDROID_JWT"
 
 # Max seconds to wait for the backend's receipt that a take is finished
 transcription_timeout: 30
@@ -67,7 +71,6 @@ ExecStart={python_path} -m pai_stt.daemon
 Restart=always
 RestartSec=3
 Environment="XDG_RUNTIME_DIR=%t"
-PassEnvironment={TOKEN_ENV_VAR}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pai-stt
@@ -123,7 +126,6 @@ def setup() -> int:
             "import-environment",
             "WAYLAND_DISPLAY",
             "XDG_RUNTIME_DIR",
-            TOKEN_ENV_VAR,
         ],
         capture_output=True,
     )
@@ -284,21 +286,27 @@ def main() -> NoReturn:
             sys.exit(1)
         if cmd == "transcript":
             sys.exit(print_transcript(RECORDINGS_DIR, sys.argv[2]))
-        token = os.environ.get(TOKEN_ENV_VAR, "")
-        if not token:
-            print(f"ERROR: {TOKEN_ENV_VAR} environment variable not set")
+        config = load_config()
+        try:
+            token = resolve_token(config)
+        except TokenError as e:
+            print(f"ERROR: {e}")
             sys.exit(1)
-        socket_url = load_config()["pai_cloud"]["socket_url"]
+        socket_url = config["pai_cloud"]["socket_url"]
         sys.exit(retranscribe(RECORDINGS_DIR, sys.argv[2], socket_url, token))
 
     if cmd not in ("start", "stop", "status", "toggle"):
         print(__doc__)
         sys.exit(1)
 
+    timeout = command_timeout(cmd, load_config)
     try:
-        response = send_command(cmd)
+        response = send_command(cmd, timeout)
     except (FileNotFoundError, ConnectionRefusedError):
         print("ERROR: Daemon not running. Run 'pai-stt setup' first.")
+        sys.exit(1)
+    except TimeoutError:
+        print(f"ERROR: Daemon did not answer within {timeout:.0f}s; it may still be working.")
         sys.exit(1)
     print(response)
     sys.exit(0 if response.startswith("OK") else 1)
