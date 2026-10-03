@@ -77,7 +77,8 @@ path delivered it.
 ## Configuration
 
 Edit `~/.config/pai-stt/config.yaml`; all options are in `config.example.yaml`, including the
-`silence_gate` block (on, auto by default; `manual` uses a fixed threshold in dBFS). A missing
+`silence_gate` block (on, auto by default; `manual` uses a fixed threshold in dBFS) and `capture.gain_db` (fixed gain
+in dB on the audio that is measured and sent; the local recording stays as captured). A missing
 option stops the daemon with a message naming it.
 
 ## Uninstall

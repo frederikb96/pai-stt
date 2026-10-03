@@ -20,10 +20,12 @@ import logging
 import os
 import signal
 import socket as socket_module
+import subprocess
 import sys
 import uuid
 from datetime import datetime
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -32,6 +34,7 @@ import yaml
 from pai_stt.bearer import TokenError, resolve_token
 from pai_stt.clipboard import clipboard_payload, copy_text
 from pai_stt.device import default_mic, device_name
+from pai_stt.gain import MAX_GAIN_DB, apply_gain
 from pai_stt.paths import (
     CONFIG_FILE,
     OUTPUT_DIR,
@@ -67,6 +70,7 @@ REQUIRED_CONFIG = (
     ("token_command",),
     ("transcription_timeout",),
     ("silence_gate",),
+    ("capture", "gain_db"),
 )
 
 # What stop adds to `transcription_timeout` in the worst case: the tail, the pw-record
@@ -104,6 +108,37 @@ def setup_logging(level: str) -> None:
     logger.addHandler(handler)
 
 
+@lru_cache(maxsize=1)
+def _pw_record_supports_raw() -> bool:
+    """Whether this `pw-record` has `--raw` (PipeWire 1.3.81 and newer)."""
+    try:
+        result = subprocess.run(["pw-record", "--help"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--raw" in result.stdout + result.stderr
+
+
+def capture_command() -> list[str]:
+    """The `pw-record` command that writes bare PCM16 samples to stdout.
+
+    Newer PipeWire wraps stdout in an AU container header unless `--raw` is passed; the pump
+    forwards every byte as audio, so the header would open each take with a click. Older
+    versions write bare samples to `-` already and do not know the flag.
+    """
+    command = [
+        "pw-record",
+        "--rate",
+        str(SAMPLE_RATE),
+        "--format",
+        "s16",
+        "--channels",
+        "1",
+    ]
+    if _pw_record_supports_raw():
+        command.append("--raw")
+    return [*command, "-"]
+
+
 def load_config() -> dict[str, Any]:
     """Load configuration from config.yaml. Fails if not found."""
     if not CONFIG_FILE.exists():
@@ -124,6 +159,17 @@ def load_config() -> dict[str, Any]:
                     )
                     sys.exit(1)
                 node = node[key]
+        gain_db = config["capture"]["gain_db"]
+        if isinstance(gain_db, bool) or not isinstance(gain_db, (int, float)):
+            print(f"[CONFIG] ERROR: capture.gain_db must be a number in {CONFIG_FILE}", flush=True)
+            sys.exit(1)
+        if abs(gain_db) > MAX_GAIN_DB:
+            print(
+                f"[CONFIG] ERROR: capture.gain_db must be within +/-{MAX_GAIN_DB:g} dB "
+                f"in {CONFIG_FILE}",
+                flush=True,
+            )
+            sys.exit(1)
         logger.info(f"Config loaded from {CONFIG_FILE}")
         return config
     except Exception as e:
@@ -198,6 +244,7 @@ class PaiSttDaemon:
         self._uplink_ready = False
         self._connect_task: Optional[asyncio.Task[None]] = None
         self._pending: list[Frame] = []
+        self._gain_db = 0.0
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
 
@@ -352,6 +399,7 @@ class PaiSttDaemon:
             mode=gate_config["mode"],
             manual_threshold_db=gate_config["manual_threshold_db"],
         )
+        self._gain_db = float(self.config["capture"]["gain_db"])
         self._uplink_ok = True
         self._uplink_ready = False
         self._pending = []
@@ -368,14 +416,7 @@ class PaiSttDaemon:
         # parallel and the frames captured meanwhile are flushed once it is ready.
         try:
             self.pw_record_proc = await asyncio.create_subprocess_exec(
-                "pw-record",
-                "--rate",
-                str(SAMPLE_RATE),
-                "--format",
-                "s16",
-                "--channels",
-                "1",
-                "-",
+                *capture_command(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -435,10 +476,12 @@ class PaiSttDaemon:
                     chunk = e.partial[: len(e.partial) // 2 * 2]
                     last = True
                 if chunk:
-                    frame = Frame(sample_offset, chunk)
-                    sample_offset = frame.end
+                    # The local recording keeps what the microphone delivered; the gain
+                    # applies to what the gate measures and the backend receives.
                     if self._writer:
                         self._writer.append(chunk)
+                    frame = Frame(sample_offset, apply_gain(chunk, self._gain_db))
+                    sample_offset = frame.end
                     self._pending.append(frame)
                     await self._drain_pending()
                 if last:

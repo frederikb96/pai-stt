@@ -1,6 +1,7 @@
 """Start sequence: capture and the local recording begin before the socket is ready."""
 
 import asyncio
+import struct
 import tempfile
 import unittest
 import unittest.mock
@@ -38,6 +39,7 @@ class SlowVoice:
         self.fail = fail
         self.calls: list[str] = []
         self.silence_allowed = False
+        self.sent: list[bytes] = []
 
     async def connect(self) -> None:
         await self.release.wait()
@@ -51,6 +53,7 @@ class SlowVoice:
 
     async def send_audio(self, offset: int, pcm: bytes) -> None:
         self.calls.append(f"audio@{offset}")
+        self.sent.append(pcm)
 
     async def send_silence(self, at_sample: int) -> None:
         self.calls.append("silence")
@@ -74,14 +77,16 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.pw = LivePwRecord()
+        self.spawned: list[list[str]] = []
 
-    async def _start(self, voice: SlowVoice) -> PaiSttDaemon:
+    async def _start(self, voice: SlowVoice, gain_db: float = 0) -> PaiSttDaemon:
         daemon = PaiSttDaemon(
             {
                 "transcription_timeout": 5,
                 "token_command": "sh -c 'printf fake-token'",
                 "pai_cloud": {"socket_url": "wss://example/socket"},
                 "silence_gate": {"enabled": False, "mode": "auto", "manual_threshold_db": -45},
+                "capture": {"gain_db": gain_db},
             }
         )
         daemon.play_sound = lambda _f: None  # type: ignore[method-assign]
@@ -92,7 +97,8 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
 
         daemon.copy_to_clipboard = copy  # type: ignore[method-assign]
 
-        async def spawn(*_a: Any, **_k: Any) -> LivePwRecord:
+        async def spawn(*args: Any, **_k: Any) -> LivePwRecord:
+            self.spawned.append(list(args))
             return self.pw
 
         patches = [
@@ -103,6 +109,7 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
             unittest.mock.patch.object(daemon_module, "device_name", lambda: "test"),
             unittest.mock.patch.object(daemon_module, "default_mic", lambda: None),
             unittest.mock.patch.object(daemon_module, "STOP_TAIL_S", 0.01),
+            unittest.mock.patch.object(daemon_module, "_pw_record_supports_raw", lambda: True),
             unittest.mock.patch.object(daemon_module.asyncio, "create_subprocess_exec", spawn),
             unittest.mock.patch.object(daemon_module, "VoiceSocketClient", lambda *_a, **_k: voice),
         ]
@@ -116,6 +123,29 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
     async def _settle(self) -> None:
         for _ in range(5):
             await asyncio.sleep(0)
+
+    async def test_capture_is_started_with_the_raw_flag_so_no_header_reaches_the_pump(self) -> None:
+        voice = SlowVoice(fail=False)
+        voice.release.set()
+        daemon = await self._start(voice)
+        (argv,) = self.spawned
+        self.assertEqual(argv[0], "pw-record")
+        self.assertIn("--raw", argv)
+        self.assertEqual(argv[-1], "-")
+        await daemon.stop_recording()
+
+    async def test_gain_applies_to_the_sent_audio_and_not_to_the_local_recording(self) -> None:
+        voice = SlowVoice(fail=False)
+        voice.release.set()
+        daemon = await self._start(voice, gain_db=6.0206)  # x2
+        self.pw.stdout.feed_data(struct.pack("<hhhh", 100, -100, 20000, -20000) * 400)
+        await self._settle()
+        await daemon.stop_recording()
+        sent = b"".join(voice.sent)
+        self.assertEqual(struct.unpack("<hhhh", sent[:8]), (200, -200, 32767, -32768))
+        (wav,) = self.dir.glob("*.wav")
+        recorded = wav.read_bytes()[recordings.WAV_HEADER_BYTES :]
+        self.assertEqual(struct.unpack("<hhhh", recorded[:8]), (100, -100, 20000, -20000))
 
     async def test_frames_captured_before_ready_are_recorded_then_flushed_in_order(self) -> None:
         voice = SlowVoice(fail=False)

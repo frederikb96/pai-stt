@@ -20,3 +20,9 @@ silence_gate:
   enabled: true
   mode: auto
   manual_threshold_db: -45
+
+# Fixed gain applied to the audio the silence gate measures and the backend
+# receives (-30 to 30 dB; 0 leaves it unchanged). The local recording stays
+# as captured. Boosts the microphone noise by the same amount.
+capture:
+  gain_db: 0

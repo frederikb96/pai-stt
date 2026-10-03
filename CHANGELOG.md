@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Fixed
+
+- Takes no longer open with a click: on PipeWire versions that wrap `pw-record` output in a
+  container header unless `--raw` is passed, that header was forwarded as audio.
+
 ### Changed
 
 - The bearer token comes from the `token_command` config key (required) instead of
@@ -19,6 +24,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ### Added
 
+- `capture.gain_db` (required, `0` leaves the audio unchanged): fixed gain on the audio the
+  silence gate measures and the backend receives; the local recording stays as captured.
 - Silence gate (auto or manual threshold, one-second pre-roll), announced to the backend with
   `silence`; `caps.silence_gate` on `hello`.
 - Device identification on `hello` (hostname and the default PipeWire source).
