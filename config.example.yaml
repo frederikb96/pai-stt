@@ -6,6 +6,10 @@ pai_cloud:
   # Full wss:// URL of the PAI Cloud voice socket.
   socket_url: wss://your-pai-cloud-host/api/voice/socket
 
+# Command printing the bearer token on stdout, run for every recording and
+# re-transcription; the token is never stored or logged.
+token_command: "secret get PAI_ANDROID_JWT"
+
 # Max seconds to wait for the backend's receipt that a take is finished
 transcription_timeout: 30
 

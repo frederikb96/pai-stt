@@ -71,6 +71,7 @@ async def _stop(
     daemon.pw_record_proc = FakePwRecord(bytes(CHUNK_BYTES * chunks))  # type: ignore[assignment]
     daemon._gate = SilenceGate(enabled=True, mode="auto", manual_threshold_db=-45)
     daemon._take_id = "take-1"
+    daemon._uplink_ready = True
     daemon._writer = recordings.RecordingWriter(directory, "take-1")
     daemon.state = State.RECORDING
     daemon.pump_task = asyncio.create_task(daemon._pump_audio())

@@ -31,8 +31,9 @@ pai-stt setup
 ```
 
 Edit `~/.config/pai-stt/config.yaml` and set `pai_cloud.socket_url` to your deployment's voice
-socket. The bearer token for it is read from the `PAI_STT_TOKEN` environment variable, not
-stored in the config file.
+socket and `token_command` to a command that prints the bearer token (for example a
+password-store lookup). The command runs for every recording and re-transcription; the
+token is never stored in the config file, the environment or the service unit.
 
 ## Usage
 
@@ -90,7 +91,7 @@ pipx uninstall pai-stt
 
 - **PipeWire:** `pw-record` for audio capture, `pw-play` for sound feedback
 - **wl-clipboard:** `wl-paste` for clipboard verification, `wl-copy` as fallback writer
-- **A bearer token** for the configured PAI Cloud deployment, in `PAI_STT_TOKEN`
+- **A bearer token** for the configured PAI Cloud deployment, printed by `token_command`
 
 ## Tests
 

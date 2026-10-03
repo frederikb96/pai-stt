@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Changed
+
+- The bearer token comes from the `token_command` config key (required) instead of
+  an environment variable; the service unit no longer passes any token through its environment.
+- Capture and the local recording start before the voice socket is connected; the audio captured
+  meanwhile is sent once the socket is ready, and a failed connection keeps the recording for
+  `retranscribe`.
+- `pai-stt stop` and `toggle` wait longer than `transcription_timeout` and report a slow daemon
+  with a message instead of a traceback.
+
 ### Added
 
 - Silence gate (auto or manual threshold, one-second pre-roll), announced to the backend with
