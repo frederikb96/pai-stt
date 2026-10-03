@@ -6,5 +6,13 @@ pai_cloud:
   # Full wss:// URL of the PAI Cloud voice socket.
   socket_url: wss://your-pai-cloud-host/api/voice/socket
 
-# Max seconds to wait for a finished transcription after stopping recording
-transcription_timeout: 120
+# Max seconds to wait for the backend's receipt that a take is finished
+transcription_timeout: 30
+
+# Stop sending audio after a sustained quiet stretch (capture and the local
+# recording continue). mode: auto adapts to the room; manual uses
+# manual_threshold_db (dBFS, -70 to -20).
+silence_gate:
+  enabled: true
+  mode: auto
+  manual_threshold_db: -45

@@ -9,17 +9,23 @@ Usage:
     pai-stt stop               Stop recording
     pai-stt toggle             Toggle recording (default)
     pai-stt status             Check daemon status
+    pai-stt recordings         List past recordings (newest first)
+    pai-stt transcript <id|last>     Print a past recording's transcript
+    pai-stt retranscribe <id|last>   Transcribe a past recording again via the backend
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from pai_stt.daemon import TOKEN_ENV_VAR, send_command
-from pai_stt.paths import CONFIG_DIR, CONFIG_FILE
+from pai_stt import batch, recordings
+from pai_stt.daemon import TOKEN_ENV_VAR, load_config, send_command
+from pai_stt.paths import CONFIG_DIR, CONFIG_FILE, RECORDINGS_DIR
 
 SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
 SERVICE_FILE = SYSTEMD_DIR / "pai-stt.service"
@@ -33,8 +39,16 @@ pai_cloud:
   # Full wss:// URL of the PAI Cloud voice socket.
   socket_url: wss://your-pai-cloud-host/api/voice/socket
 
-# Max seconds to wait for a finished transcription after stopping recording
-transcription_timeout: 120
+# Max seconds to wait for the backend's receipt that a take is finished
+transcription_timeout: 30
+
+# Stop sending audio after a sustained quiet stretch (capture and the local
+# recording continue). mode: auto adapts to the room; manual uses
+# manual_threshold_db (dBFS, -70 to -20).
+silence_gate:
+  enabled: true
+  mode: auto
+  manual_threshold_db: -45
 """
 
 
@@ -207,6 +221,50 @@ def teardown() -> int:
     return 0
 
 
+def list_recordings(directory: Path) -> int:
+    """Print one line per past recording, newest first."""
+    for rec in recordings.list_recordings(directory):
+        started = datetime.fromisoformat(rec.started_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        flag = "" if rec.transcript_complete else " (incomplete)"
+        preview = rec.transcript[:60].replace("\n", " ")
+        print(f"{rec.id[:8]}  {started}  {rec.duration_ms / 1000:7.1f}s{flag}  {preview}")
+    return 0
+
+
+def print_transcript(directory: Path, ref: str) -> int:
+    try:
+        rec = recordings.resolve(directory, ref)
+    except LookupError as e:
+        print(f"ERROR: {e}")
+        return 1
+    if not rec.transcript:
+        print(f"ERROR: recording {rec.id[:8]} has no transcript; try 'pai-stt retranscribe'")
+        return 1
+    print(rec.transcript)
+    return 0
+
+
+def retranscribe(directory: Path, ref: str, socket_url: str, token: str) -> int:
+    """Send a past recording through the backend's batch route and store the result."""
+    try:
+        rec = recordings.resolve(directory, ref)
+    except LookupError as e:
+        print(f"ERROR: {e}")
+        return 1
+    pcm = recordings.read_pcm(directory, rec.id)
+    if not pcm:
+        print(f"ERROR: recording {rec.id[:8]} holds no audio")
+        return 1
+    try:
+        text = batch.transcribe(pcm, rec.id, socket_url, token)
+    except Exception as e:
+        print(f"ERROR: transcription failed: {e}")
+        return 1
+    recordings.store_transcript(directory, rec.id, text, "batch")
+    print(text)
+    return 0
+
+
 def main() -> NoReturn:
     """Entry point."""
     cmd = (sys.argv[1] if len(sys.argv) > 1 else "toggle").lower()
@@ -217,6 +275,21 @@ def main() -> NoReturn:
         sys.exit(teardown())
     if cmd == "install-extension":
         sys.exit(install_extension())
+
+    if cmd == "recordings":
+        sys.exit(list_recordings(RECORDINGS_DIR))
+    if cmd in ("transcript", "retranscribe"):
+        if len(sys.argv) != 3:
+            print(__doc__)
+            sys.exit(1)
+        if cmd == "transcript":
+            sys.exit(print_transcript(RECORDINGS_DIR, sys.argv[2]))
+        token = os.environ.get(TOKEN_ENV_VAR, "")
+        if not token:
+            print(f"ERROR: {TOKEN_ENV_VAR} environment variable not set")
+            sys.exit(1)
+        socket_url = load_config()["pai_cloud"]["socket_url"]
+        sys.exit(retranscribe(RECORDINGS_DIR, sys.argv[2], socket_url, token))
 
     if cmd not in ("start", "stop", "status", "toggle"):
         print(__doc__)

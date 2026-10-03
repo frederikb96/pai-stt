@@ -13,3 +13,6 @@ CONFIG_FILE = CONFIG_DIR / "config.yaml"
 def ensure_output_dir() -> None:
     """Create OUTPUT_DIR owner-only. An existing directory keeps its mode."""
     OUTPUT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+# One WAV plus one JSON sidecar per take, newest few kept.
+RECORDINGS_DIR = Path.home() / ".local" / "share" / "pai-stt" / "recordings"
