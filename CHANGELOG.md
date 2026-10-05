@@ -11,6 +11,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 - Takes no longer open with a click: on PipeWire versions that wrap `pw-record` output in a
   container header unless `--raw` is passed, that header was forwarded as audio.
+- A voice socket that drops mid-recording (an ingress restart, a network blip) is reconnected
+  with the resume token instead of leaving the rest of the take untranscribed. Audio the backend
+  had not acknowledged is sent again and audio captured meanwhile is queued; on a fresh bus the
+  take is reopened and the text already received is kept.
 
 ### Changed
 

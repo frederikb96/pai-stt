@@ -14,9 +14,11 @@ separate opt-in.
 
 `connect()` starts the receive loop as a task this client owns and returns
 once `ready` has arrived, so the liveness `ping` is answered for as long as
-the connection lives. `_dispatch` logs anything it does not recognise rather
-than raising, so a frame type added later degrades to a warning instead of a
-crash.
+the connection lives. Every audio frame is held until its `ack` arrives; a
+later `connect()` with the `resume_token` keeps those frames, and
+`resend_unacked()` puts them on the new socket. `_dispatch` logs anything it
+does not recognise rather than raising, so a frame type added later degrades
+to a warning instead of a crash.
 """
 
 from __future__ import annotations
@@ -74,6 +76,15 @@ class VoiceSocketCallbacks:
     on_closed: Callable[[], None] = _noop
 
 
+@dataclass
+class _HeldFrame:
+    """An audio frame not yet acked; `seq` is None until it is sent on this socket."""
+
+    seq: Optional[int]
+    sample_offset: int
+    pcm: bytes
+
+
 @dataclass(frozen=True)
 class TakeDone:
     """The `take_done` receipt: nothing more is coming for `take_id`."""
@@ -105,6 +116,8 @@ class VoiceSocketClient:
         self._seq = 0
         self._resume_token: Optional[str] = None
         self._silence_allowed = False
+        self._resumed = False
+        self._unacked: list[_HeldFrame] = []
         self._ready = asyncio.Event()
         self._reader: Optional[asyncio.Task[None]] = None
         self._take_futures: dict[str, asyncio.Future[Optional[TakeDone]]] = {}
@@ -119,11 +132,22 @@ class VoiceSocketClient:
         """The token a later `connect()` can present to reattach to this bus."""
         return self._resume_token
 
+    @property
+    def resumed(self) -> bool:
+        """The last `ready.resumed`: the bus, and the take open on it, survived the reconnect."""
+        return self._resumed
+
     async def connect(self, resume_token: Optional[str] = None) -> None:
-        """Open the socket, send `hello`, start reading and wait for `ready`."""
+        """Open the socket, send `hello`, start reading and wait for `ready`.
+
+        Frames still unacked from an earlier socket stay held for `resend_unacked()`.
+        """
         self._ws = await websockets.connect(self._url)
         self._seq = 0
         self._ready.clear()
+        # The previous socket's close resolved these with None; a take still
+        # open on this connection waits for its receipt afresh.
+        self._take_futures = {k: f for k, f in self._take_futures.items() if not f.done()}
         hello: dict[str, Any] = {
             "type": "hello",
             "transport": TRANSPORT_NAME,
@@ -167,11 +191,16 @@ class VoiceSocketClient:
         msg_type = msg.get("type")
         if msg_type == "ready":
             self._resume_token = msg.get("resume_token")
+            self._resumed = bool(msg.get("resumed", False))
             self._silence_allowed = bool(msg.get("silence_allowed", False))
             self._ready.set()
             self._callbacks.on_ready(msg)
         elif msg_type == "ack":
-            self._callbacks.on_ack(msg["through_seq"])
+            through_seq = msg["through_seq"]
+            self._unacked = [
+                f for f in self._unacked if f.seq is None or f.seq > through_seq
+            ]
+            self._callbacks.on_ack(through_seq)
         elif msg_type == "state":
             self._silence_allowed = bool(msg.get("silence_allowed", False))
             self._callbacks.on_state(msg)
@@ -227,8 +256,25 @@ class VoiceSocketClient:
         """Send one uplink audio frame while the gate is open."""
         if self._ws is None:
             raise RuntimeError("connect() must run before send_audio()")
+        # Held before the send, so a frame the socket fails on is kept too.
+        self._unacked.append(_HeldFrame(self._seq, sample_offset, pcm))
         await self._ws.send(encode_up_frame(self._seq, sample_offset, pcm))
         self._seq += 1
+
+    def hold(self, frames: list[tuple[int, bytes]]) -> None:
+        """Keep `(sample_offset, pcm)` frames that never reached a socket, for resending."""
+        self._unacked.extend(_HeldFrame(None, offset, pcm) for offset, pcm in frames)
+
+    async def resend_unacked(self) -> int:
+        """Send every held frame again on this socket, in order; returns how many."""
+        backlog, self._unacked = self._unacked, []
+        for i, frame in enumerate(backlog):
+            try:
+                await self.send_audio(frame.sample_offset, frame.pcm)
+            except Exception:
+                self._unacked.extend(backlog[i + 1 :])
+                raise
+        return len(backlog)
 
     async def played(self, ref: int) -> None:
         """Acknowledge that downlink audio carrying `ref` finished playing."""

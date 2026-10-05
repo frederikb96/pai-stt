@@ -16,6 +16,7 @@ implements.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -63,6 +64,12 @@ SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 # Capture keeps running this long after stop is pressed so the last syllable
 # still in the pipeline is not cut off.
 STOP_TAIL_S = 0.3
+
+# How long a recording keeps trying to reconnect a dropped voice socket. Audio
+# captured meanwhile is queued and sent on reconnect; much more than this would
+# overrun what the backend's realtime transcription accepts in one burst.
+RECONNECT_WINDOW_S = 20.0
+RECONNECT_MAX_DELAY_S = 2.0
 
 # Config keys that have no built-in default; see config.example.yaml.
 REQUIRED_CONFIG = (
@@ -235,7 +242,9 @@ class PaiSttDaemon:
         self.shutdown_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
         self.current_text: str = ""
-        self._committed_segments: dict[int, tuple[Optional[int], str]] = {}
+        # Keyed by (bus generation, seq): a reconnect onto a fresh bus restarts `seq` at 0.
+        self._committed_segments: dict[tuple[int, int], tuple[Optional[int], str]] = {}
+        self._bus_generation = 0
         self._partial_text: str = ""
         self._take_id: Optional[str] = None
         self._writer: Optional[RecordingWriter] = None
@@ -243,6 +252,9 @@ class PaiSttDaemon:
         self._uplink_ok = True
         self._uplink_ready = False
         self._connect_task: Optional[asyncio.Task[None]] = None
+        self._reconnect_task: Optional[asyncio.Task[None]] = None
+        self._silence_at: Optional[int] = None
+        self._sent_through = 0
         self._pending: list[Frame] = []
         self._gain_db = 0.0
         self.dbus_interface: Optional[Any] = None
@@ -318,7 +330,73 @@ class PaiSttDaemon:
 
     def _on_closed(self) -> None:
         logger.warning("Voice socket closed")
-        self._uplink_ok = False
+        self._link_lost()
+
+    def _link_lost(self) -> None:
+        """The socket dropped mid-recording: queue audio and reconnect in the background.
+
+        Only while recording with an established uplink — a deliberate close, a
+        failed first connect or a drop during the stop sequence ends here.
+        """
+        if self.state != State.RECORDING or not self._uplink_ready:
+            return
+        self._uplink_ready = False
+        if self.voice is None or self._take_id is None:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect(self.voice, self._take_id)
+            )
+
+    async def _reconnect(self, voice: VoiceSocketClient, take_id: str) -> None:
+        """Reattach with the resume token and resend unacked audio; the queue drains after.
+
+        On a resumed bus the take is still open there. On a fresh one the gate
+        reopens with the same `take_id`, and the partial the old bus never
+        committed is kept as committed text, since nothing will finalise it.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RECONNECT_WINDOW_S
+        delay = 0.25
+        while True:
+            try:
+                await voice.close()
+                await voice.connect(resume_token=voice.resume_token)
+                if not voice.resumed:
+                    self._commit_partial()
+                    self._bus_generation += 1
+                    await voice.open_gate(reason="reconnect", take_id=take_id)
+                resent = await voice.resend_unacked()
+                if self._gate is not None and self._gate.is_withholding:
+                    if self._silence_at is not None:
+                        await voice.send_silence(self._silence_at)
+                break
+            except Exception as e:
+                if loop.time() + delay > deadline:
+                    logger.error(
+                        f"Voice socket reconnect gave up, recording continues locally: {e}"
+                    )
+                    self._uplink_ok = False
+                    self._pending = []
+                    self.play_sound(SOUND_ERROR)
+                    with contextlib.suppress(Exception):
+                        await voice.close()
+                    return
+                logger.warning(f"Voice socket reconnect failed, retrying: {e}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX_DELAY_S)
+        logger.info(
+            f"Voice socket reconnected resumed={voice.resumed} resent_frames={resent} "
+            f"queued_frames={len(self._pending)}"
+        )
+        self._uplink_ready = True
+
+    def _commit_partial(self) -> None:
+        if self._partial_text:
+            # Sorts after every seq the old bus delivered; that bus sends nothing more.
+            key = (self._bus_generation, sys.maxsize)
+            self._committed_segments[key] = (self._sent_through, self._partial_text)
+            self._partial_text = ""
 
     def _on_notice(self, msg: dict[str, Any]) -> None:
         severity = msg.get("severity", "info")
@@ -347,7 +425,7 @@ class PaiSttDaemon:
         if take_id is not None and self._take_id is not None and take_id != self._take_id:
             return
         if is_final:
-            self._committed_segments[seq] = (end_sample, text)
+            self._committed_segments[(self._bus_generation, seq)] = (end_sample, text)
             self._partial_text = ""
         else:
             self._partial_text = text
@@ -358,7 +436,7 @@ class PaiSttDaemon:
     def _assembled_text(self) -> str:
         ordered = sorted(
             self._committed_segments.items(),
-            key=lambda item: (item[1][0] if item[1][0] is not None else item[0], item[0]),
+            key=lambda item: (item[1][0] if item[1][0] is not None else item[0][1], item[0]),
         )
         parts = [text for _, (_, text) in ordered]
         if self._partial_text:
@@ -382,7 +460,10 @@ class PaiSttDaemon:
         self.emit_state("recording", "")
         self.current_text = ""
         self._committed_segments = {}
+        self._bus_generation = 0
         self._partial_text = ""
+        self._silence_at = None
+        self._sent_through = 0
         self._take_id = str(uuid.uuid4())
         logger.info("Starting recording session")
 
@@ -456,9 +537,8 @@ class PaiSttDaemon:
         if not self._uplink_ok:
             self._pending = []
             return
-        if not self._uplink_ready:
-            return
-        while self._pending:
+        # Re-checked per frame: a send that loses the link leaves the rest queued.
+        while self._pending and self._uplink_ready:
             await self._feed(self._pending.pop(0))
 
     async def _pump_audio(self) -> None:
@@ -495,6 +575,7 @@ class PaiSttDaemon:
         was_withholding = self._gate.is_withholding
         result = self._gate.push(frame, self.voice.silence_allowed)
         if result.silence_at is not None:
+            self._silence_at = result.silence_at
             logger.info(f"gate withhold at_sample={result.silence_at}")
         elif was_withholding and result.send:
             logger.info(f"gate resume preroll_frames={len(result.send)}")
@@ -503,14 +584,24 @@ class PaiSttDaemon:
     async def _send(self, frames: list[Frame], silence_at: Optional[int] = None) -> None:
         if not self._uplink_ok or self.voice is None:
             return
-        try:
-            for frame in frames:
-                await self.voice.send_audio(frame.offset, frame.pcm)
-            if silence_at is not None:
-                await self.voice.send_silence(silence_at)
-        except Exception as e:
-            logger.error(f"Uplink failed, recording continues locally: {e}")
-            self._uplink_ok = False
+        voice = self.voice
+        for i, frame in enumerate(frames):
+            try:
+                await voice.send_audio(frame.offset, frame.pcm)
+            except Exception as e:
+                # The failed frame is already held by the client; the rest join it.
+                voice.hold([(f.offset, f.pcm) for f in frames[i + 1 :]])
+                logger.warning(f"Uplink send failed: {e}")
+                self._link_lost()
+                return
+            self._sent_through = frame.end
+        if silence_at is not None:
+            try:
+                await voice.send_silence(silence_at)
+            except Exception as e:
+                # The reconnect announces the withholding again.
+                logger.warning(f"Uplink send failed: {e}")
+                self._link_lost()
 
     async def _terminate_pw_record(self) -> None:
         if not self.pw_record_proc:
@@ -550,6 +641,10 @@ class PaiSttDaemon:
         if self._connect_task:
             await self._connect_task
             self._connect_task = None
+            await self._drain_pending()
+        if self._reconnect_task:
+            await self._reconnect_task
+            self._reconnect_task = None
             await self._drain_pending()
 
         take_id = self._take_id
