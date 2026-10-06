@@ -177,17 +177,63 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
         daemon._on_transcript("after", True, 0, 48000, "take-1")
         self.assertEqual(daemon.current_text, "first never committed after")
 
-    async def test_reconnect_gives_up_after_its_window_and_recording_continues_locally(
-        self,
-    ) -> None:
+    async def test_reconnect_retries_until_stop_then_makes_one_last_attempt(self) -> None:
         voice = FakeVoice([None] * 50)
         daemon = _recording_daemon(voice)
-        with unittest.mock.patch.object(daemon_module, "RECONNECT_WINDOW_S", 0.05):
+        with unittest.mock.patch.object(daemon_module, "RECONNECT_MAX_DELAY_S", 0.01):
             daemon._on_closed()
             assert daemon._reconnect_task is not None
+            await asyncio.sleep(0.2)
+            self.assertFalse(daemon._reconnect_task.done())
+            attempts = voice.calls.count("connect-failed")
+            daemon._stopping.set()
             await daemon._reconnect_task
+        self.assertLessEqual(voice.calls.count("connect-failed") - attempts, 2)
         self.assertFalse(daemon._uplink_ok)
-        self.assertFalse(daemon._uplink_ready)
+        self.assertTrue(daemon._gapped)
+
+    async def test_pressing_stop_retries_at_once_instead_of_waiting_out_the_backoff(
+        self,
+    ) -> None:
+        voice = FakeVoice([None, True])
+        daemon = _recording_daemon(voice)
+        with unittest.mock.patch.object(daemon_module, "RECONNECT_MAX_DELAY_S", 60):
+            daemon._on_closed()
+            assert daemon._reconnect_task is not None
+            await asyncio.sleep(0.05)
+            daemon._stopping.set()
+            await asyncio.wait_for(daemon._reconnect_task, 0.1)
+        self.assertTrue(daemon._uplink_ready)
+        self.assertFalse(daemon._gapped)
+
+    async def test_a_failed_first_connect_is_retried_like_a_drop(self) -> None:
+        voice = FakeVoice([None, False])
+        daemon = _recording_daemon(voice)
+        daemon._uplink_ready = False
+        with unittest.mock.patch.object(daemon_module, "RECONNECT_MAX_DELAY_S", 0.01):
+            await daemon._connect_uplink(voice, "take-1")  # type: ignore[arg-type]
+            assert daemon._reconnect_task is not None
+            await daemon._reconnect_task
+        self.assertIn("open_gate(take-1)", voice.calls)
+        self.assertTrue(daemon._uplink_ready)
+
+    def test_a_backlog_longer_than_a_replay_keeps_only_its_last_second(self) -> None:
+        daemon = _recording_daemon(FakeVoice([]))
+        step = CHUNK_BYTES // 2
+        frames = int(daemon_module.REPLAY_MAX_S * 10) + 50
+        daemon._pending = [Frame(i * step, LOUD) for i in range(frames)]
+        skipped = daemon._trim_backlog()
+        self.assertEqual(len(daemon._pending), 10)
+        self.assertEqual(skipped, frames - 10)
+        self.assertEqual(daemon._pending[-1].offset, (frames - 1) * step)
+        self.assertTrue(daemon._gapped)
+
+    def test_a_backlog_within_a_replay_is_sent_whole(self) -> None:
+        daemon = _recording_daemon(FakeVoice([]))
+        daemon._pending = [Frame(i * CHUNK_BYTES // 2, LOUD) for i in range(100)]
+        self.assertEqual(daemon._trim_backlog(), 0)
+        self.assertEqual(len(daemon._pending), 100)
+        self.assertFalse(daemon._gapped)
 
     async def test_a_drop_during_the_stop_sequence_does_not_reconnect(self) -> None:
         daemon = _recording_daemon(FakeVoice([]))

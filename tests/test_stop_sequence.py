@@ -61,8 +61,13 @@ class FakeVoice:
 
 
 async def _stop(
-    ended: Optional[str], directory: Path, chunks: int = 5
+    ended: Optional[str],
+    directory: Path,
+    chunks: int = 5,
+    batch: Optional[str] = "batch text",
+    copied: Optional[list[str]] = None,
 ) -> tuple[PaiSttDaemon, FakeVoice]:
+    """Stop a recording; `batch` is what re-transcribing returns, None for a failure."""
     daemon = PaiSttDaemon(
         {"transcription_timeout": 5, "pai_cloud": {"socket_url": "wss://example/socket"}}
     )
@@ -77,15 +82,27 @@ async def _stop(
     daemon.pump_task = asyncio.create_task(daemon._pump_audio())
     daemon.play_sound = lambda _f: None  # type: ignore[method-assign]
     daemon.emit_state = lambda *_a: None  # type: ignore[method-assign]
-    copied: list[str] = []
+    daemon.current_text = "live text"
+    sink = copied if copied is not None else []
 
     async def copy(text: str) -> bool:
-        copied.append(text)
+        sink.append(text)
         return True
 
+    def transcribe(*_a: object) -> str:
+        if batch is None:
+            raise ConnectionError("backend down")
+        return batch
+
     daemon.copy_to_clipboard = copy  # type: ignore[method-assign]
-    with unittest.mock.patch.object(daemon_module, "STOP_TAIL_S", 0.01):
+    with (
+        unittest.mock.patch.object(daemon_module, "STOP_TAIL_S", 0.01),
+        unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "token"),
+        unittest.mock.patch.object(daemon_module.batch, "transcribe", transcribe),
+    ):
         await daemon.stop_recording()
+        if daemon._batch_task:
+            await daemon._batch_task
     return daemon, voice
 
 
@@ -106,14 +123,45 @@ class TestStopSequence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec.duration_ms, 500)
         self.assertTrue(rec.transcript_complete)
 
-    async def test_an_unavailable_receipt_marks_the_recording_incomplete(self) -> None:
-        daemon, _ = await _stop("unavailable", self.dir)
+    async def test_an_unavailable_receipt_replaces_the_live_text_with_the_batch_one(
+        self,
+    ) -> None:
+        copied: list[str] = []
+        daemon, _ = await _stop("unavailable", self.dir, copied=copied)
         self.assertEqual(daemon.state, State.IDLE)
-        self.assertFalse(recordings.list_recordings(self.dir)[0].transcript_complete)
+        self.assertEqual(copied, ["batch text"])
+        (rec,) = recordings.list_recordings(self.dir)
+        self.assertEqual((rec.transcript, rec.transcript_source), ("batch text", "batch"))
+        self.assertTrue(rec.transcript_complete)
 
-    async def test_no_receipt_still_closes_cleanly_and_marks_incomplete(self) -> None:
+    async def test_no_receipt_still_closes_cleanly_and_falls_back_to_the_batch(self) -> None:
         daemon, voice = await _stop(None, self.dir)
         self.assertEqual(voice.calls[-2:], ["bye", "close"])
+        self.assertEqual(daemon.current_text, "batch text")
+
+    async def test_a_gap_in_the_live_text_is_transcribed_even_after_a_clean_receipt(
+        self,
+    ) -> None:
+        copied: list[str] = []
+        daemon = await self._stop_gapped(copied)
+        self.assertEqual(daemon.current_text, "batch text")
+        self.assertEqual(copied, ["batch text"])
+
+    async def _stop_gapped(self, copied: list[str]) -> PaiSttDaemon:
+        original = PaiSttDaemon._pump_audio
+
+        async def pump(daemon: PaiSttDaemon) -> None:
+            daemon._gapped = True
+            await original(daemon)
+
+        with unittest.mock.patch.object(PaiSttDaemon, "_pump_audio", pump):
+            daemon, _ = await _stop("committed", self.dir, copied=copied)
+        return daemon
+
+    async def test_a_failed_batch_keeps_the_live_text_incomplete(self) -> None:
+        copied: list[str] = []
+        daemon, _ = await _stop("unavailable", self.dir, batch=None, copied=copied)
+        self.assertEqual(copied, ["live text"])
         self.assertEqual(daemon.state, State.IDLE)
         self.assertFalse(recordings.list_recordings(self.dir)[0].transcript_complete)
 

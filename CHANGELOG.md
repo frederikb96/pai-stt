@@ -15,6 +15,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
   with the resume token instead of leaving the rest of the take untranscribed. Audio the backend
   had not acknowledged is sent again and audio captured meanwhile is queued; on a fresh bus the
   take is reopened and the text already received is kept.
+- A voice socket that stays down longer than 20 s (a backend deploy) no longer ends the live
+  transcript for the rest of the take: reconnecting continues for as long as the recording runs,
+  a failed first connect is retried the same way, and pressing stop makes one more attempt at
+  once. Whenever the live text is missing part of the take, stop replaces it with a
+  re-transcription of the whole local recording, delivered to the clipboard when it is ready.
 
 ### Changed
 

@@ -18,7 +18,9 @@ worth reading and reusing, and because a public repository gets unmetered CI.
 - Client-side silence gate: after a quiet stretch audio stops being sent (the backend keeps the
   session open); the last second is sent first when speech resumes. Auto mode adapts to the room.
 - Stop waits for the backend's receipt that the take is finished, so the last words arrive
-- A dropped connection is resumed mid-recording; unacknowledged and queued audio is sent again
+- A dropped connection is retried for as long as the recording runs and once more at stop;
+  unacknowledged and queued audio is sent again. If the live text missed part of the take (a
+  long outage, a backend restart), stop re-transcribes the whole local recording instead
 - Past recordings on disk (newest 10) with commands to list, print and re-transcribe them
 - No local speech-to-text credentials — authentication is a single bearer token for the backend
 

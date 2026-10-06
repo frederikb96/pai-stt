@@ -32,6 +32,7 @@ from typing import Any, Callable, Optional
 
 import yaml
 
+from pai_stt import batch, recordings
 from pai_stt.bearer import TokenError, resolve_token
 from pai_stt.clipboard import clipboard_payload, copy_text
 from pai_stt.device import default_mic, device_name
@@ -65,11 +66,15 @@ SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 # still in the pipeline is not cut off.
 STOP_TAIL_S = 0.3
 
-# How long a recording keeps trying to reconnect a dropped voice socket. Audio
-# captured meanwhile is queued and sent on reconnect; much more than this would
-# overrun what the backend's realtime transcription accepts in one burst.
-RECONNECT_WINDOW_S = 20.0
-RECONNECT_MAX_DELAY_S = 2.0
+# A dropped voice socket is retried for as long as the recording runs, and once
+# more when stop is pressed. Audio captured meanwhile is queued and sent on
+# reconnect up to REPLAY_MAX_S; a longer backlog would overrun what the backend's
+# realtime transcription accepts in one burst, so it is skipped live (bar the last
+# REPLAY_KEEP_S) and the take is re-transcribed from the local recording at stop.
+RECONNECT_MAX_DELAY_S = 5.0
+RECONNECT_LOG_EVERY_S = 30.0
+REPLAY_MAX_S = 15.0
+REPLAY_KEEP_S = 1.0
 
 # Config keys that have no built-in default; see config.example.yaml.
 REQUIRED_CONFIG = (
@@ -253,6 +258,10 @@ class PaiSttDaemon:
         self._uplink_ready = False
         self._connect_task: Optional[asyncio.Task[None]] = None
         self._reconnect_task: Optional[asyncio.Task[None]] = None
+        self._stopping = asyncio.Event()
+        # Some captured audio never reached the live transcript: stop re-transcribes the take.
+        self._gapped = False
+        self._batch_task: Optional[asyncio.Task[None]] = None
         self._silence_at: Optional[int] = None
         self._sent_through = 0
         self._pending: list[Frame] = []
@@ -351,13 +360,16 @@ class PaiSttDaemon:
     async def _reconnect(self, voice: VoiceSocketClient, take_id: str) -> None:
         """Reattach with the resume token and resend unacked audio; the queue drains after.
 
-        On a resumed bus the take is still open there. On a fresh one the gate
-        reopens with the same `take_id`, and the partial the old bus never
+        Retries until it succeeds or stop is pressed, which wakes it for one last
+        attempt. On a resumed bus the take is still open there. On a fresh one the
+        gate reopens with the same `take_id`, and the partial the old bus never
         committed is kept as committed text, since nothing will finalise it.
         """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + RECONNECT_WINDOW_S
+        started = loop.time()
+        next_log = started
         delay = 0.25
+        warned = False
         while True:
             try:
                 await voice.close()
@@ -372,24 +384,52 @@ class PaiSttDaemon:
                         await voice.send_silence(self._silence_at)
                 break
             except Exception as e:
-                if loop.time() + delay > deadline:
+                down_s = loop.time() - started
+                if self._stopping.is_set():
                     logger.error(
-                        f"Voice socket reconnect gave up, recording continues locally: {e}"
+                        f"Voice socket still down at stop after {down_s:.0f}s, "
+                        f"transcribing the local recording instead: {e}"
                     )
                     self._uplink_ok = False
+                    self._gapped = True
                     self._pending = []
-                    self.play_sound(SOUND_ERROR)
                     with contextlib.suppress(Exception):
                         await voice.close()
                     return
-                logger.warning(f"Voice socket reconnect failed, retrying: {e}")
-                await asyncio.sleep(delay)
+                if not warned and down_s > REPLAY_MAX_S:
+                    # From here the live text has a gap; the full text arrives at stop.
+                    warned = True
+                    self.play_sound(SOUND_ERROR)
+                # Keeps the queue bounded however long the outage lasts.
+                self._trim_backlog()
+                if loop.time() >= next_log:
+                    logger.warning(
+                        f"Voice socket reconnect failed after {down_s:.0f}s, retrying: {e}"
+                    )
+                    next_log = loop.time() + RECONNECT_LOG_EVERY_S
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stopping.wait(), delay)
                 delay = min(delay * 2, RECONNECT_MAX_DELAY_S)
+        skipped = self._trim_backlog()
         logger.info(
-            f"Voice socket reconnected resumed={voice.resumed} resent_frames={resent} "
-            f"queued_frames={len(self._pending)}"
+            f"Voice socket reconnected after {loop.time() - started:.0f}s "
+            f"resumed={voice.resumed} resent_frames={resent} "
+            f"queued_frames={len(self._pending)} skipped_frames={skipped}"
         )
         self._uplink_ready = True
+
+    def _trim_backlog(self) -> int:
+        """Drop queued audio past what a realtime replay takes; returns how many frames."""
+        if not self._pending:
+            return 0
+        newest = self._pending[-1].end
+        if newest - self._pending[0].offset <= REPLAY_MAX_S * SAMPLE_RATE:
+            return 0
+        keep_from = newest - int(REPLAY_KEEP_S * SAMPLE_RATE)
+        before = len(self._pending)
+        self._pending = [f for f in self._pending if f.end > keep_from]
+        self._gapped = True
+        return before - len(self._pending)
 
     def _commit_partial(self) -> None:
         if self._partial_text:
@@ -483,6 +523,8 @@ class PaiSttDaemon:
         self._gain_db = float(self.config["capture"]["gain_db"])
         self._uplink_ok = True
         self._uplink_ready = False
+        self._stopping.clear()
+        self._gapped = False
         self._pending = []
         self.voice = VoiceSocketClient(
             self.config["pai_cloud"]["socket_url"],
@@ -516,19 +558,13 @@ class PaiSttDaemon:
         return True, "Recording started"
 
     async def _connect_uplink(self, voice: VoiceSocketClient, take_id: str) -> None:
-        """Connect and open the gate; on failure the local recording carries on alone."""
+        """Connect and open the gate; a failure is retried like a dropped socket."""
         try:
             await voice.connect()
             await voice.open_gate(reason="button", take_id=take_id)
         except Exception as e:
-            logger.error(f"Voice socket connect failed, recording continues locally: {e}")
-            self._uplink_ok = False
-            self._pending = []
-            self.play_sound(SOUND_ERROR)
-            try:
-                await voice.close()
-            except Exception as close_error:
-                logger.debug(f"Closing the failed voice socket: {close_error}")
+            logger.warning(f"Voice socket connect failed, retrying while recording: {e}")
+            self._reconnect_task = asyncio.create_task(self._reconnect(voice, take_id))
             return
         self._uplink_ready = True
 
@@ -638,6 +674,8 @@ class PaiSttDaemon:
             await self.pump_task
             self.pump_task = None
 
+        # A reconnect still under way gets one last attempt now, with all audio queued.
+        self._stopping.set()
         if self._connect_task:
             await self._connect_task
             self._connect_task = None
@@ -666,20 +704,68 @@ class PaiSttDaemon:
         self.voice = None
         self._uplink_ready = False
 
-        complete = ended is not None and ended != "unavailable"
-        if self._writer:
-            self._writer.finish(self.current_text, complete)
-            self._writer = None
+        complete = ended is not None and ended != "unavailable" and not self._gapped
+        writer, self._writer = self._writer, None
+        if writer:
+            writer.finish(self.current_text, complete)
 
-        if self.current_text:
-            await self.copy_to_clipboard(self.current_text)
-        if self.current_text and complete:
-            self.play_sound(SOUND_DONE)
-            self.emit_state("done", self.current_text[-500:])
-        else:
-            self.emit_state("partial", self.current_text[-500:])
+        if not complete and writer and take_id:
+            # The live text is missing part of the take: the batch route gets the whole
+            # local recording, in the background so a new recording can start meanwhile.
+            logger.info(f"Live transcript incomplete (ended={ended}), transcribing the recording")
+            self.emit_state("transcribing", self.current_text[-500:])
+            self.state = State.IDLE
+            self._batch_task = asyncio.create_task(
+                self._transcribe_recording(
+                    writer.directory, take_id, self.current_text, self.current_output_file
+                )
+            )
+            return True, "Recording stopped; transcribing the local recording"
+
+        await self._deliver(self.current_text, complete)
         self.state = State.IDLE
         return True, "Recording stopped"
+
+    async def _deliver(self, text: str, complete: bool) -> None:
+        if text:
+            await self.copy_to_clipboard(text)
+        if text and complete:
+            self.play_sound(SOUND_DONE)
+            self.emit_state("done", text[-500:])
+        else:
+            self.emit_state("partial", text[-500:])
+
+    async def _transcribe_recording(
+        self, directory: Path, take_id: str, live_text: str, output_file: Optional[Path]
+    ) -> None:
+        """Replace an incomplete live transcript with the batch transcript of the recording."""
+        try:
+            token = await asyncio.to_thread(resolve_token, self.config)
+            pcm = recordings.read_pcm(directory, take_id)
+            text = await asyncio.to_thread(
+                batch.transcribe, pcm, take_id, self.config["pai_cloud"]["socket_url"], token
+            )
+        except Exception as e:
+            logger.error(
+                f"Transcribing the recording failed, keeping the live text; "
+                f"'pai-stt retranscribe {take_id[:8]}' tries again: {e}"
+            )
+            self.play_sound(SOUND_ERROR)
+            if self.state == State.IDLE:
+                await self._deliver(live_text, False)
+            elif live_text:
+                await self.copy_to_clipboard(live_text)
+            return
+        recordings.store_transcript(directory, take_id, text, "batch")
+        logger.info(f"Recording transcribed: {len(text)} chars")
+        if output_file is not None:
+            output_file.write_text(text)
+        if self.state == State.IDLE:
+            self.current_text = text
+            await self._deliver(text, True)
+        else:
+            # A new recording owns the indicator; the clipboard still gets this text.
+            await self.copy_to_clipboard(text)
 
     async def toggle_recording(self) -> tuple[bool, str]:
         if self.state == State.IDLE:
