@@ -19,8 +19,9 @@ worth reading and reusing, and because a public repository gets unmetered CI.
   session open); the last second is sent first when speech resumes. Auto mode adapts to the room.
 - Stop waits for the backend's receipt that the take is finished, so the last words arrive
 - A dropped connection is retried for as long as the recording runs and once more at stop;
-  unacknowledged and queued audio is sent again. If the live text missed part of the take (a
-  long outage, a backend restart), stop re-transcribes the whole local recording instead
+  unacknowledged and queued audio is sent again. Audio the live text missed during a longer
+  outage (a backend restart) is transcribed from the local recording and inserted between
+  `STT-INTERRUPTED` markers; if the backend is still down at stop, the rest follows one marker
 - Past recordings on disk (newest 10) with commands to list, print and re-transcribe them
 - No local speech-to-text credentials — authentication is a single bearer token for the backend
 

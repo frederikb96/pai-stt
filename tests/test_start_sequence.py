@@ -40,8 +40,11 @@ class SlowVoice:
         self.calls: list[str] = []
         self.silence_allowed = False
         self.sent: list[bytes] = []
+        self.resume_token: Optional[str] = None
+        self.resumed = False
+        self.oldest_unacked_offset: Optional[int] = None
 
-    async def connect(self) -> None:
+    async def connect(self, resume_token: Optional[str] = None) -> None:
         await self.release.wait()
         if self.fail:
             raise ConnectionError("backend down")
@@ -57,6 +60,9 @@ class SlowVoice:
 
     async def send_silence(self, at_sample: int) -> None:
         self.calls.append("silence")
+
+    async def resend_unacked(self) -> int:
+        return 0
 
     async def close_gate(self, reason: str) -> None:
         self.calls.append("close_gate")
@@ -181,19 +187,27 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(daemon.state, State.IDLE)
 
-    async def test_failed_connect_keeps_the_local_recording(self) -> None:
+    async def test_a_backend_down_for_the_whole_take_is_transcribed_from_the_recording(
+        self,
+    ) -> None:
         voice = SlowVoice(fail=True)
         daemon = await self._start(voice)
         self.pw.stdout.feed_data(bytes(CHUNK_BYTES * 4))
         voice.release.set()
         await self._settle()
-        ok, _ = await daemon.stop_recording()
+        with unittest.mock.patch.object(
+            daemon_module.batch, "transcribe", lambda pcm, *_a: f"{len(pcm)} bytes"
+        ):
+            ok, _ = await daemon.stop_recording()
+            assert daemon._finish_task is not None
+            await daemon._finish_task
         self.assertTrue(ok)
         self.assertEqual(daemon.state, State.IDLE)
         self.assertNotIn("audio@0", voice.calls)
         (rec,) = recordings.list_recordings(self.dir)
         self.assertEqual(rec.duration_ms, 400)
-        self.assertFalse(rec.transcript_complete)
+        mark = daemon_module.INTERRUPTED_MARK
+        self.assertEqual(rec.transcript, f"{mark} {CHUNK_BYTES * 4} bytes")
 
 
 if __name__ == "__main__":

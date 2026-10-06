@@ -261,6 +261,11 @@ class VoiceSocketClient:
         await self._ws.send(encode_up_frame(self._seq, sample_offset, pcm))
         self._seq += 1
 
+    @property
+    def oldest_unacked_offset(self) -> Optional[int]:
+        """Sample offset of the oldest frame the backend has not acknowledged, if any."""
+        return self._unacked[0].sample_offset if self._unacked else None
+
     def hold(self, frames: list[tuple[int, bytes]]) -> None:
         """Keep `(sample_offset, pcm)` frames that never reached a socket, for resending."""
         self._unacked.extend(_HeldFrame(None, offset, pcm) for offset, pcm in frames)

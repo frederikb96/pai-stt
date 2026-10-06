@@ -66,8 +66,16 @@ async def _stop(
     chunks: int = 5,
     batch: Optional[str] = "batch text",
     copied: Optional[list[str]] = None,
+    tail_start: Optional[int] = None,
+    backfill_ok: Optional[bool] = None,
+    requests: Optional[list[tuple[int, str]]] = None,
 ) -> tuple[PaiSttDaemon, FakeVoice]:
-    """Stop a recording; `batch` is what re-transcribing returns, None for a failure."""
+    """Stop a recording; `batch` is what re-transcribing returns, None for a failure.
+
+    `tail_start` stops with the socket still down; `backfill_ok` adds a gap backfill
+    that finished that way. `requests` collects each batch call's audio length and
+    previous text.
+    """
     daemon = PaiSttDaemon(
         {"transcription_timeout": 5, "pai_cloud": {"socket_url": "wss://example/socket"}}
     )
@@ -76,20 +84,27 @@ async def _stop(
     daemon.pw_record_proc = FakePwRecord(bytes(CHUNK_BYTES * chunks))  # type: ignore[assignment]
     daemon._gate = SilenceGate(enabled=True, mode="auto", manual_threshold_db=-45)
     daemon._take_id = "take-1"
-    daemon._uplink_ready = True
+    daemon._uplink_ready = tail_start is None
+    daemon._tail_start = tail_start
+    daemon._recordings_dir = directory
     daemon._writer = recordings.RecordingWriter(directory, "take-1")
     daemon.state = State.RECORDING
     daemon.pump_task = asyncio.create_task(daemon._pump_audio())
     daemon.play_sound = lambda _f: None  # type: ignore[method-assign]
     daemon.emit_state = lambda *_a: None  # type: ignore[method-assign]
+    daemon._committed_segments = {(0, 0): (800, "live text")}
     daemon.current_text = "live text"
+    if backfill_ok is not None:
+        daemon._backfills = [asyncio.create_task(asyncio.sleep(0, backfill_ok))]
     sink = copied if copied is not None else []
 
     async def copy(text: str) -> bool:
         sink.append(text)
         return True
 
-    def transcribe(*_a: object) -> str:
+    def transcribe(pcm: bytes, *rest: str) -> str:
+        if requests is not None:
+            requests.append((len(pcm), rest[-1]))
         if batch is None:
             raise ConnectionError("backend down")
         return batch
@@ -101,8 +116,8 @@ async def _stop(
         unittest.mock.patch.object(daemon_module.batch, "transcribe", transcribe),
     ):
         await daemon.stop_recording()
-        if daemon._batch_task:
-            await daemon._batch_task
+        if daemon._finish_task:
+            await daemon._finish_task
     return daemon, voice
 
 
@@ -139,24 +154,32 @@ class TestStopSequence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(voice.calls[-2:], ["bye", "close"])
         self.assertEqual(daemon.current_text, "batch text")
 
-    async def test_a_gap_in_the_live_text_is_transcribed_even_after_a_clean_receipt(
+    async def test_a_socket_still_down_at_stop_gets_the_rest_after_one_marker(
         self,
     ) -> None:
         copied: list[str] = []
-        daemon = await self._stop_gapped(copied)
-        self.assertEqual(daemon.current_text, "batch text")
+        requests: list[tuple[int, str]] = []
+        await _stop(None, self.dir, tail_start=1600, copied=copied, requests=requests)
+        mark = daemon_module.INTERRUPTED_MARK
+        self.assertEqual(copied, [f"live text {mark} batch text"])
+        self.assertEqual(requests, [(5 * CHUNK_BYTES - 1600 * 2, "live text")])
+        (rec,) = recordings.list_recordings(self.dir)
+        self.assertEqual(rec.transcript_source, "live+batch")
+        self.assertTrue(rec.transcript_complete)
+
+    async def test_backfilled_gaps_with_a_clean_receipt_need_no_further_batch(self) -> None:
+        copied: list[str] = []
+        requests: list[tuple[int, str]] = []
+        await _stop("committed", self.dir, backfill_ok=True, copied=copied, requests=requests)
+        self.assertEqual((copied, requests), (["live text"], []))
+        self.assertTrue(recordings.list_recordings(self.dir)[0].transcript_complete)
+
+    async def test_a_failed_backfill_transcribes_the_whole_recording(self) -> None:
+        copied: list[str] = []
+        requests: list[tuple[int, str]] = []
+        await _stop("committed", self.dir, backfill_ok=False, copied=copied, requests=requests)
         self.assertEqual(copied, ["batch text"])
-
-    async def _stop_gapped(self, copied: list[str]) -> PaiSttDaemon:
-        original = PaiSttDaemon._pump_audio
-
-        async def pump(daemon: PaiSttDaemon) -> None:
-            daemon._gapped = True
-            await original(daemon)
-
-        with unittest.mock.patch.object(PaiSttDaemon, "_pump_audio", pump):
-            daemon, _ = await _stop("committed", self.dir, copied=copied)
-        return daemon
+        self.assertEqual(requests, [(5 * CHUNK_BYTES, "")])
 
     async def test_a_failed_batch_keeps_the_live_text_incomplete(self) -> None:
         copied: list[str] = []

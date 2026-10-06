@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Changed
+
+- Audio the live transcript missed during an outage longer than 15 s is no longer covered by
+  re-transcribing the whole recording at stop: once the voice socket is back, just that stretch
+  is transcribed from the local recording and inserted between `STT-INTERRUPTED` markers. When
+  the backend is still down at stop, the untranscribed rest is appended after one marker. The
+  whole recording is transcribed only when a stretch fails or the backend reports lost words.
+
 ## [0.1.0] - 2026-10-06
 
 ### Fixed

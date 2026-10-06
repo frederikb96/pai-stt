@@ -70,11 +70,13 @@ STOP_TAIL_S = 0.3
 # more when stop is pressed. Audio captured meanwhile is queued and sent on
 # reconnect up to REPLAY_MAX_S; a longer backlog would overrun what the backend's
 # realtime transcription accepts in one burst, so it is skipped live (bar the last
-# REPLAY_KEEP_S) and the take is re-transcribed from the local recording at stop.
+# REPLAY_KEEP_S) and transcribed from the local recording through the batch route
+# instead, spliced into the text between INTERRUPTED_MARKs.
 RECONNECT_MAX_DELAY_S = 5.0
 RECONNECT_LOG_EVERY_S = 30.0
 REPLAY_MAX_S = 15.0
 REPLAY_KEEP_S = 1.0
+INTERRUPTED_MARK = "STT-INTERRUPTED"
 
 # Config keys that have no built-in default; see config.example.yaml.
 REQUIRED_CONFIG = (
@@ -235,6 +237,20 @@ if DBUS_AVAILABLE:
             self.StateChanged()
 
 
+Segments = dict[tuple[int, int], tuple[Optional[int], str]]
+
+
+def assemble(segments: Segments, partial: str = "") -> str:
+    """Segments in `end_sample` order (key order for one without), then the partial."""
+    ordered = sorted(
+        segments.items(),
+        key=lambda item: (item[1][0] if item[1][0] is not None else item[0][1], item[0]),
+    )
+    parts = [text for _, (_, text) in ordered]
+    parts.append(partial)
+    return " ".join(part for part in parts if part)
+
+
 class PaiSttDaemon:
     """Owns the recording state machine, the voice socket and DBus."""
 
@@ -248,20 +264,25 @@ class PaiSttDaemon:
         self.current_output_file: Optional[Path] = None
         self.current_text: str = ""
         # Keyed by (bus generation, seq): a reconnect onto a fresh bus restarts `seq` at 0.
-        self._committed_segments: dict[tuple[int, int], tuple[Optional[int], str]] = {}
+        self._committed_segments: Segments = {}
         self._bus_generation = 0
         self._partial_text: str = ""
         self._take_id: Optional[str] = None
         self._writer: Optional[RecordingWriter] = None
+        self._recordings_dir = RECORDINGS_DIR
         self._gate: Optional[SilenceGate] = None
         self._uplink_ok = True
         self._uplink_ready = False
         self._connect_task: Optional[asyncio.Task[None]] = None
         self._reconnect_task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
-        # Some captured audio never reached the live transcript: stop re-transcribes the take.
-        self._gapped = False
-        self._batch_task: Optional[asyncio.Task[None]] = None
+        # First sample of the stretch the current outage keeps from the live transcript.
+        self._gap_start: Optional[int] = None
+        # First sample never transcribed live when stop found the socket still down.
+        self._tail_start: Optional[int] = None
+        self._captured_through = 0
+        self._backfills: list[asyncio.Task[bool]] = []
+        self._finish_task: Optional[asyncio.Task[None]] = None
         self._silence_at: Optional[int] = None
         self._sent_through = 0
         self._pending: list[Frame] = []
@@ -388,16 +409,20 @@ class PaiSttDaemon:
                 if self._stopping.is_set():
                     logger.error(
                         f"Voice socket still down at stop after {down_s:.0f}s, "
-                        f"transcribing the local recording instead: {e}"
+                        f"transcribing the rest from the local recording: {e}"
                     )
                     self._uplink_ok = False
-                    self._gapped = True
+                    starts = [self._gap_start, voice.oldest_unacked_offset]
+                    if self._pending:
+                        starts.append(self._pending[0].offset)
+                    self._tail_start = min((s for s in starts if s is not None), default=None)
+                    self._commit_partial()
                     self._pending = []
                     with contextlib.suppress(Exception):
                         await voice.close()
                     return
                 if not warned and down_s > REPLAY_MAX_S:
-                    # From here the live text has a gap; the full text arrives at stop.
+                    # From here the live text has a gap, filled in once the socket is back.
                     warned = True
                     self.play_sound(SOUND_ERROR)
                 # Keeps the queue bounded however long the outage lasts.
@@ -416,6 +441,10 @@ class PaiSttDaemon:
             f"resumed={voice.resumed} resent_frames={resent} "
             f"queued_frames={len(self._pending)} skipped_frames={skipped}"
         )
+        if self._gap_start is not None:
+            end = self._pending[0].offset if self._pending else self._captured_through
+            self._start_backfill(take_id, self._gap_start, end)
+            self._gap_start = None
         self._uplink_ready = True
 
     def _trim_backlog(self) -> int:
@@ -426,10 +455,56 @@ class PaiSttDaemon:
         if newest - self._pending[0].offset <= REPLAY_MAX_S * SAMPLE_RATE:
             return 0
         keep_from = newest - int(REPLAY_KEEP_S * SAMPLE_RATE)
+        if self._gap_start is None:
+            self._gap_start = self._pending[0].offset
         before = len(self._pending)
         self._pending = [f for f in self._pending if f.end > keep_from]
-        self._gapped = True
         return before - len(self._pending)
+
+    def _start_backfill(self, take_id: str, start: int, end: int) -> None:
+        """Splice a placeholder for samples `start`..`end` into the text and transcribe them.
+
+        The segment sorts by `end`, so it lands between the live text before the
+        gap and the live text after it.
+        """
+        previous = self._assembled_text()
+        segments = self._committed_segments
+        segments[(-1, start)] = (end, f"{INTERRUPTED_MARK} … {INTERRUPTED_MARK}")
+        self._refresh_text()
+        logger.info(f"Backfilling samples {start}..{end} from the local recording")
+        self._backfills.append(
+            asyncio.create_task(self._backfill(take_id, segments, start, end, previous))
+        )
+
+    async def _backfill(
+        self, take_id: str, segments: Segments, start: int, end: int, previous: str
+    ) -> bool:
+        """Fill one gap's placeholder with its batch transcript; False if that failed."""
+        try:
+            text = await self._batch_text(take_id, start, end, previous)
+        except Exception as e:
+            logger.error(f"Backfilling samples {start}..{end} failed: {e}")
+            return False
+        segments[(-1, start)] = (end, f"{INTERRUPTED_MARK} {text} {INTERRUPTED_MARK}")
+        if segments is self._committed_segments:
+            self._refresh_text()
+        return True
+
+    async def _batch_text(
+        self, take_id: str, start: int, end: Optional[int], previous: str
+    ) -> str:
+        """Batch-transcribe samples `start`..`end` (to the end if None) of the local recording."""
+        token = await asyncio.to_thread(resolve_token, self.config)
+        pcm = recordings.read_pcm(self._recordings_dir, take_id)
+        pcm = pcm[start * 2 : None if end is None else end * 2]
+        return await asyncio.to_thread(
+            batch.transcribe,
+            pcm,
+            take_id,
+            self.config["pai_cloud"]["socket_url"],
+            token,
+            previous,
+        )
 
     def _commit_partial(self) -> None:
         if self._partial_text:
@@ -469,19 +544,16 @@ class PaiSttDaemon:
             self._partial_text = ""
         else:
             self._partial_text = text
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
         self.current_text = self._assembled_text()
         self._write_result_file(self.current_text)
-        self.emit_state(self.state.value, self.current_text[-500:])
+        if self.state != State.IDLE:
+            self.emit_state(self.state.value, self.current_text[-500:])
 
     def _assembled_text(self) -> str:
-        ordered = sorted(
-            self._committed_segments.items(),
-            key=lambda item: (item[1][0] if item[1][0] is not None else item[0][1], item[0]),
-        )
-        parts = [text for _, (_, text) in ordered]
-        if self._partial_text:
-            parts.append(self._partial_text)
-        return " ".join(part for part in parts if part)
+        return assemble(self._committed_segments, self._partial_text)
 
     async def start_recording(self) -> tuple[bool, str]:
         if self.state != State.IDLE:
@@ -499,6 +571,7 @@ class PaiSttDaemon:
         self.play_sound(SOUND_START)
         self.emit_state("recording", "")
         self.current_text = ""
+        # A new dict, not a cleared one: a finishing take still holds the old one.
         self._committed_segments = {}
         self._bus_generation = 0
         self._partial_text = ""
@@ -524,7 +597,10 @@ class PaiSttDaemon:
         self._uplink_ok = True
         self._uplink_ready = False
         self._stopping.clear()
-        self._gapped = False
+        self._gap_start = None
+        self._tail_start = None
+        self._captured_through = 0
+        self._backfills = []
         self._pending = []
         self.voice = VoiceSocketClient(
             self.config["pai_cloud"]["socket_url"],
@@ -552,7 +628,8 @@ class PaiSttDaemon:
             self.state = State.IDLE
             return False, f"Failed to start audio capture: {e}"
 
-        self._writer = RecordingWriter(RECORDINGS_DIR, self._take_id)
+        self._recordings_dir = RECORDINGS_DIR
+        self._writer = RecordingWriter(self._recordings_dir, self._take_id)
         self._connect_task = asyncio.create_task(self._connect_uplink(self.voice, self._take_id))
         self.pump_task = asyncio.create_task(self._pump_audio())
         return True, "Recording started"
@@ -597,7 +674,7 @@ class PaiSttDaemon:
                     if self._writer:
                         self._writer.append(chunk)
                     frame = Frame(sample_offset, apply_gain(chunk, self._gain_db))
-                    sample_offset = frame.end
+                    sample_offset = self._captured_through = frame.end
                     self._pending.append(frame)
                     await self._drain_pending()
                 if last:
@@ -704,23 +781,30 @@ class PaiSttDaemon:
         self.voice = None
         self._uplink_ready = False
 
-        complete = ended is not None and ended != "unavailable" and not self._gapped
-        writer, self._writer = self._writer, None
-        if writer:
-            writer.finish(self.current_text, complete)
+        live_ok = ended is not None and ended != "unavailable"
+        backfills, self._backfills = self._backfills, []
+        complete = live_ok and not backfills and self._tail_start is None
+        if self._writer:
+            self._writer.finish(self.current_text, complete)
+            self._writer = None
 
-        if not complete and writer and take_id:
-            # The live text is missing part of the take: the batch route gets the whole
-            # local recording, in the background so a new recording can start meanwhile.
-            logger.info(f"Live transcript incomplete (ended={ended}), transcribing the recording")
+        if not complete and take_id:
+            # Gaps and the tail are spliced in from the local recording, in the
+            # background so a new recording can start meanwhile.
+            self._commit_partial()
             self.emit_state("transcribing", self.current_text[-500:])
             self.state = State.IDLE
-            self._batch_task = asyncio.create_task(
-                self._transcribe_recording(
-                    writer.directory, take_id, self.current_text, self.current_output_file
+            self._finish_task = asyncio.create_task(
+                self._finish_take(
+                    take_id,
+                    self._committed_segments,
+                    live_ok,
+                    self._tail_start,
+                    backfills,
+                    self.current_output_file,
                 )
             )
-            return True, "Recording stopped; transcribing the local recording"
+            return True, "Recording stopped; transcribing from the local recording"
 
         await self._deliver(self.current_text, complete)
         self.state = State.IDLE
@@ -735,35 +819,49 @@ class PaiSttDaemon:
         else:
             self.emit_state("partial", text[-500:])
 
-    async def _transcribe_recording(
-        self, directory: Path, take_id: str, live_text: str, output_file: Optional[Path]
+    async def _finish_take(
+        self,
+        take_id: str,
+        segments: Segments,
+        live_ok: bool,
+        tail_start: Optional[int],
+        backfills: list[asyncio.Task[bool]],
+        output_file: Optional[Path],
     ) -> None:
-        """Replace an incomplete live transcript with the batch transcript of the recording."""
+        """Complete a take whose live text has gaps: wait for their backfills, add the tail.
+
+        The tail is what stop found never transcribed live. When a backfill failed,
+        or the backend's receipt says words were lost, the whole recording is
+        transcribed instead.
+        """
+        gaps_ok = all(await asyncio.gather(*backfills))
+        text = assemble(segments)
+        complete = False
         try:
-            token = await asyncio.to_thread(resolve_token, self.config)
-            pcm = recordings.read_pcm(directory, take_id)
-            text = await asyncio.to_thread(
-                batch.transcribe, pcm, take_id, self.config["pai_cloud"]["socket_url"], token
-            )
+            if gaps_ok and tail_start is not None:
+                tail = await self._batch_text(take_id, tail_start, None, text)
+                segments[(-1, tail_start)] = (sys.maxsize, f"{INTERRUPTED_MARK} {tail}")
+                text, complete, source = assemble(segments), True, "live+batch"
+            elif gaps_ok and live_ok:
+                complete, source = True, "live+batch"
+            else:
+                text = await self._batch_text(take_id, 0, None, "")
+                complete, source = True, "batch"
         except Exception as e:
             logger.error(
-                f"Transcribing the recording failed, keeping the live text; "
+                f"Transcribing from the recording failed, keeping the live text; "
                 f"'pai-stt retranscribe {take_id[:8]}' tries again: {e}"
             )
             self.play_sound(SOUND_ERROR)
-            if self.state == State.IDLE:
-                await self._deliver(live_text, False)
-            elif live_text:
-                await self.copy_to_clipboard(live_text)
-            return
-        recordings.store_transcript(directory, take_id, text, "batch")
-        logger.info(f"Recording transcribed: {len(text)} chars")
+        if complete:
+            recordings.store_transcript(self._recordings_dir, take_id, text, source)
+            logger.info(f"Take completed from the recording ({source}): {len(text)} chars")
         if output_file is not None:
             output_file.write_text(text)
-        if self.state == State.IDLE:
+        if self._take_id == take_id and self.state == State.IDLE:
             self.current_text = text
-            await self._deliver(text, True)
-        else:
+            await self._deliver(text, complete)
+        elif text:
             # A new recording owns the indicator; the clipboard still gets this text.
             await self.copy_to_clipboard(text)
 

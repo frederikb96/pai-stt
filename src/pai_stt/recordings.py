@@ -62,7 +62,7 @@ class RecordingWriter:
 
     def __init__(self, directory: Path, take_id: str) -> None:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.directory = directory
+        self._directory = directory
         self.take_id = take_id
         self._bytes = 0
         self._file: Optional[BinaryIO] = open(_wav(directory, take_id), "wb")
@@ -96,8 +96,8 @@ class RecordingWriter:
         self._meta.update(
             transcript=transcript, transcript_source="live", transcript_complete=complete
         )
-        _write_sidecar(self.directory, self.take_id, self._meta)
-        prune(self.directory)
+        _write_sidecar(self._directory, self.take_id, self._meta)
+        prune(self._directory)
 
 
 def list_recordings(directory: Path) -> list[Recording]:

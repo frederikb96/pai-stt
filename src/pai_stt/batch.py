@@ -53,12 +53,19 @@ def _multipart(fields: dict[str, str], wav: bytes) -> tuple[bytes, str]:
     return body, f"multipart/form-data; boundary={boundary}"
 
 
-def transcribe(pcm: bytes, take_id: str, socket_url: str, token: str) -> str:
-    """Batch-transcribe `pcm` (16 kHz mono PCM16) and return the joined text."""
+def transcribe(
+    pcm: bytes, take_id: str, socket_url: str, token: str, previous_text: str = ""
+) -> str:
+    """Batch-transcribe `pcm` (16 kHz mono PCM16) and return the joined text.
+
+    `previous_text` is what precedes `pcm` in the take; the backend strips the
+    words it repeats from the start of the first piece.
+    """
     url = f"{http_base(socket_url)}/api/voice/takes/{take_id}/audio"
     text = ""
     for piece in pieces(pcm):
-        fields = {"previous_text": text[-PREVIOUS_TEXT_CHARS:]} if text else {}
+        context = f"{previous_text} {text}".strip()
+        fields = {"previous_text": context[-PREVIOUS_TEXT_CHARS:]} if context else {}
         body, content_type = _multipart(fields, wav_header(len(piece)) + piece)
         request = urllib.request.Request(
             url,

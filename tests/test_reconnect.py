@@ -3,13 +3,16 @@
 import asyncio
 import json
 import struct
+import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 from typing import Any, Optional
 
 from websockets.asyncio.server import ServerConnection, serve
 
 from pai_stt import daemon as daemon_module
+from pai_stt import recordings
 from pai_stt.daemon import CHUNK_BYTES, PaiSttDaemon, State
 from pai_stt.framing import encode_up_frame
 from pai_stt.silence_gate import Frame, SilenceGate
@@ -124,6 +127,10 @@ class FakeVoice:
     async def send_silence(self, at_sample: int) -> None:
         self.calls.append("silence")
 
+    @property
+    def oldest_unacked_offset(self) -> Optional[int]:
+        return self.unacked[0][0] if self.unacked else None
+
 
 def _recording_daemon(voice: FakeVoice) -> PaiSttDaemon:
     daemon = PaiSttDaemon({"pai_cloud": {"socket_url": "wss://example/socket"}})
@@ -180,6 +187,7 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
     async def test_reconnect_retries_until_stop_then_makes_one_last_attempt(self) -> None:
         voice = FakeVoice([None] * 50)
         daemon = _recording_daemon(voice)
+        daemon._pending = [Frame(4800, LOUD)]
         with unittest.mock.patch.object(daemon_module, "RECONNECT_MAX_DELAY_S", 0.01):
             daemon._on_closed()
             assert daemon._reconnect_task is not None
@@ -190,7 +198,7 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
             await daemon._reconnect_task
         self.assertLessEqual(voice.calls.count("connect-failed") - attempts, 2)
         self.assertFalse(daemon._uplink_ok)
-        self.assertTrue(daemon._gapped)
+        self.assertEqual(daemon._tail_start, 4800)
 
     async def test_pressing_stop_retries_at_once_instead_of_waiting_out_the_backoff(
         self,
@@ -204,7 +212,7 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
             daemon._stopping.set()
             await asyncio.wait_for(daemon._reconnect_task, 0.1)
         self.assertTrue(daemon._uplink_ready)
-        self.assertFalse(daemon._gapped)
+        self.assertEqual(daemon._backfills, [])
 
     async def test_a_failed_first_connect_is_retried_like_a_drop(self) -> None:
         voice = FakeVoice([None, False])
@@ -226,14 +234,66 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(daemon._pending), 10)
         self.assertEqual(skipped, frames - 10)
         self.assertEqual(daemon._pending[-1].offset, (frames - 1) * step)
-        self.assertTrue(daemon._gapped)
+        self.assertEqual(daemon._gap_start, 0)
 
     def test_a_backlog_within_a_replay_is_sent_whole(self) -> None:
         daemon = _recording_daemon(FakeVoice([]))
         daemon._pending = [Frame(i * CHUNK_BYTES // 2, LOUD) for i in range(100)]
         self.assertEqual(daemon._trim_backlog(), 0)
         self.assertEqual(len(daemon._pending), 100)
-        self.assertFalse(daemon._gapped)
+        self.assertIsNone(daemon._gap_start)
+
+    async def test_a_long_outage_is_backfilled_between_markers_once_the_socket_is_back(
+        self,
+    ) -> None:
+        voice = FakeVoice([True])
+        daemon = _recording_daemon(voice)
+        step = CHUNK_BYTES // 2
+        frames = int(daemon_module.REPLAY_MAX_S * 10) + 50
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon._recordings_dir = Path(tmp)
+            writer = recordings.RecordingWriter(Path(tmp), "take-1")
+            writer.append(bytes(range(256)) * (frames * CHUNK_BYTES // 256))
+            daemon._on_transcript("before", True, 0, 0, "take-1")
+            daemon._pending = [Frame(i * step, LOUD) for i in range(frames)]
+            requests: list[tuple[int, str]] = []
+            release = asyncio.Event()
+
+            async def transcribe(*args: Any) -> str:
+                pcm, _take, _url, _token, previous = args
+                requests.append((len(pcm), previous))
+                await release.wait()
+                return "gap words"
+
+            with (
+                unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "t"),
+                unittest.mock.patch.object(
+                    daemon_module.asyncio, "to_thread", _to_thread(transcribe)
+                ),
+            ):
+                daemon._uplink_ready = False
+                await daemon._reconnect(voice, "take-1")  # type: ignore[arg-type]
+                mark = daemon_module.INTERRUPTED_MARK
+                self.assertEqual(daemon.current_text, f"before {mark} … {mark}")
+                daemon._on_transcript("after", True, 1, frames * step, "take-1")
+                release.set()
+                (backfill,) = daemon._backfills
+                self.assertTrue(await backfill)
+            writer.finish("", False)
+        kept = len(daemon._pending)
+        self.assertEqual(requests, [((frames - kept) * step * 2, "before")])
+        self.assertEqual(daemon.current_text, f"before {mark} gap words {mark} after")
+
+
+def _to_thread(transcribe: Any) -> Any:
+    """`asyncio.to_thread` that awaits `transcribe` for the batch call and runs the rest."""
+
+    async def run(func: Any, *args: Any) -> Any:
+        if func is daemon_module.batch.transcribe:
+            return await transcribe(*args)
+        return func(*args)
+
+    return run
 
     async def test_a_drop_during_the_stop_sequence_does_not_reconnect(self) -> None:
         daemon = _recording_daemon(FakeVoice([]))
