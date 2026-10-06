@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-06
+
 ### Fixed
 
 - Takes no longer open with a click: on PipeWire versions that wrap `pw-record` output in a
