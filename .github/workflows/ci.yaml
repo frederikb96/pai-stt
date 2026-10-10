@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -41,3 +39,20 @@ jobs:
           import xml.dom.minidom
           xml.dom.minidom.parse('extension/schemas/org.gnome.shell.extensions.pai-stt.gschema.xml')
           "
+
+  ci-ok:
+    name: CI ok
+    needs: [python, extension]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          for result in \
+            "${{ needs.python.result }}" \
+            "${{ needs.extension.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "A required job did not succeed: $result"
+              exit 1
+            fi
+          done
