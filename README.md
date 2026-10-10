@@ -98,8 +98,14 @@ pipx uninstall pai-stt
 - **wl-clipboard:** `wl-paste` for clipboard verification, `wl-copy` as fallback writer
 - **A bearer token** for the configured PAI Cloud deployment, printed by `token_command`
 
-## Tests
+## Development
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
+ruff check src/ tests/
+mypy src/
 python -m pytest tests/
+node --check extension/extension.js && node --check extension/prefs.js
 ```
+
+Pull requests run the same checks in CI.
