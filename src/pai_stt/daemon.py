@@ -5,9 +5,11 @@ Runs as a systemd user service, listens on a Unix socket for commands from
 the CLI and the GNOME Shell keyboard shortcut. Commands: START, START-BATCH,
 STOP, STATUS, TOGGLE, TOGGLE-BATCH.
 
-Captures the microphone with pw-record. A live take streams it to the PAI Cloud
-voice socket while it records; a batch take only records, and its whole local
-recording goes through the backend's batch route after stop. Emits DBus
+Captures the microphone with pw-record and streams it to the PAI Cloud voice
+socket. A live take is transcribed as it records; a batch take is a
+server-owned take the backend transcribes after the seal (pieces of it already
+during pauses, when the backend is set up for that), and whatever the server
+never received is uploaded from the local recording afterwards. Emits DBus
 signals (state, input level) for the GNOME extension and serves it the past
 recordings.
 `_on_transcript` folds each `transcript` down frame into the take's
@@ -27,8 +29,9 @@ import signal
 import socket as socket_module
 import subprocess
 import sys
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -36,7 +39,7 @@ from typing import Any, Callable, Optional
 
 import yaml
 
-from pai_stt import batch, recordings
+from pai_stt import batch, recordings, takes
 from pai_stt.bearer import TokenError, resolve_token
 from pai_stt.clipboard import clipboard_payload, copy_text
 from pai_stt.device import default_mic, device_name
@@ -81,6 +84,15 @@ RECONNECT_LOG_EVERY_S = 30.0
 REPLAY_MAX_S = 15.0
 REPLAY_KEEP_S = 1.0
 INTERRUPTED_MARK = "STT-INTERRUPTED"
+
+# A batch take's seal waits this long for `take_state` before sealing over REST.
+SEAL_WAIT_S = 30.0
+# How long a batch take's finish keeps retrying the backend and waiting for the text.
+FINISH_DEADLINE_S = 2 * 3600.0
+TAKE_POLL_FIRST_S = 2.0
+TAKE_POLL_MAX_S = 15.0
+# A batch take left unfinished by a daemon restart is finished at startup if this recent.
+RESUME_WINDOW_S = 24 * 3600.0
 
 # Config keys that have no built-in default; see config.example.yaml.
 REQUIRED_CONFIG = (
@@ -318,6 +330,7 @@ class PaiSttDaemon:
         self._gain_db = 0.0
         self._mode = "live"
         self._retranscribing: set[str] = set()
+        self.resume_task: Optional[asyncio.Task[None]] = None
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
 
@@ -435,7 +448,7 @@ class PaiSttDaemon:
         return VoiceSocketCallbacks(
             on_ready=lambda msg: logger.info(f"Voice socket ready: {msg}"),
             on_ack=lambda through_seq: logger.debug(f"ack through_seq={through_seq}"),
-            on_state=lambda msg: logger.debug(f"state: {msg}"),
+            on_state=self._on_state,
             on_notice=self._on_notice,
             on_clear=lambda: logger.debug("clear"),
             on_audio=lambda ref, pcm: logger.warning(
@@ -444,6 +457,23 @@ class PaiSttDaemon:
             on_transcript=self._on_transcript,
             on_closed=self._on_closed,
         )
+
+    def _on_state(self, msg: dict[str, Any]) -> None:
+        logger.debug(f"state: {msg}")
+        phase = msg.get("phase")
+        if self._mode == "batch" and self.state == State.RECORDING and phase not in (
+            None, "capturing",
+        ):
+            # A backend that does not store takes for this transport answers with a
+            # live engine; nothing sent there is kept, so the take goes over REST at stop.
+            logger.error(
+                f"Backend gave the batch take a '{phase}' engine instead of capturing it; "
+                "the recording is uploaded after stop"
+            )
+            self._uplink_ok = False
+            self._uplink_ready = False
+            if self.voice is not None:
+                asyncio.create_task(self.voice.close())
 
     def _on_closed(self) -> None:
         logger.warning("Voice socket closed")
@@ -528,10 +558,11 @@ class PaiSttDaemon:
             f"resumed={voice.resumed} resent_frames={resent} "
             f"queued_frames={len(self._pending)} skipped_frames={skipped}"
         )
-        if self._gap_start is not None:
+        if self._gap_start is not None and self._mode == "live":
             end = self._pending[0].offset if self._pending else self._captured_through
             self._start_backfill(take_id, self._gap_start, end)
-            self._gap_start = None
+        # A batch take's gap is reported `missing` after the seal and uploaded then.
+        self._gap_start = None
         self._uplink_ready = True
 
     def _trim_backlog(self) -> int:
@@ -643,10 +674,10 @@ class PaiSttDaemon:
         return assemble(self._committed_segments, self._partial_text)
 
     async def start_recording(self, mode: str = "live") -> tuple[bool, str]:
-        """Start a take. A live one streams to the voice socket, a batch one only records.
+        """Start a take: live, transcribed as it streams, or batch, a server-owned take.
 
-        A batch take needs no backend until it is transcribed after stop, so it
-        records even with the backend down.
+        A batch take records whether or not the socket connects; what the server
+        did not receive is uploaded after stop.
         """
         if mode not in MODES:
             return False, f"Unknown mode: {mode}"
@@ -654,15 +685,13 @@ class PaiSttDaemon:
             return False, f"Cannot start: state is {self.state.value}"
         # Claim the state before the first await so a second START cannot slip in.
         self.state = State.RECORDING
-        token = ""
-        if mode == "live":
-            try:
-                token = await asyncio.to_thread(resolve_token, self.config)
-            except TokenError as e:
-                logger.error(f"No bearer token: {e}")
-                self.play_sound(SOUND_ERROR)
-                self.state = State.IDLE
-                return False, f"No bearer token: {e}"
+        try:
+            token = await asyncio.to_thread(resolve_token, self.config)
+        except TokenError as e:
+            logger.error(f"No bearer token: {e}")
+            self.play_sound(SOUND_ERROR)
+            self.state = State.IDLE
+            return False, f"No bearer token: {e}"
 
         self._mode = mode
         self.play_sound(SOUND_START)
@@ -685,8 +714,11 @@ class PaiSttDaemon:
         RESULT_SYMLINK.symlink_to(self.current_output_file)
 
         gate_config = self.config["silence_gate"]
+        # A batch take bills nothing while it records, so all of it is sent: the
+        # backend then holds the whole take and finds pauses in the audio itself.
+        gate_enabled = gate_config["enabled"] and mode == "live"
         self._gate = SilenceGate(
-            enabled=gate_config["enabled"],
+            enabled=gate_enabled,
             mode=gate_config["mode"],
             manual_threshold_db=gate_config["manual_threshold_db"],
         )
@@ -699,15 +731,18 @@ class PaiSttDaemon:
         self._captured_through = 0
         self._backfills = []
         self._pending = []
-        if mode == "live":
-            self.voice = VoiceSocketClient(
-                self.config["pai_cloud"]["socket_url"],
-                token,
-                self._voice_callbacks(),
-                device_name=device_name(),
-                mic=default_mic(),
-                silence_gate=gate_config["enabled"],
-            )
+        batch_take = mode == "batch"
+        self.voice = VoiceSocketClient(
+            self.config["pai_cloud"]["socket_url"],
+            token,
+            self._voice_callbacks(),
+            device_name=device_name(),
+            mic=default_mic(),
+            silence_gate=gate_enabled,
+            take_store=batch_take,
+            stt_mode="batch" if batch_take else None,
+            standalone=batch_take,
+        )
 
         # Capture and the local recording start first; the connection is made in
         # parallel and the frames captured meanwhile are flushed once it is ready.
@@ -870,7 +905,7 @@ class PaiSttDaemon:
 
         take_id = self._take_id
         if self._mode == "batch":
-            return self._stop_batch(take_id)
+            return await self._stop_batch(take_id)
         ended: Optional[str] = None
         if self.voice and take_id and self._uplink_ready:
             if self._gate:
@@ -918,23 +953,147 @@ class PaiSttDaemon:
         self.state = State.IDLE
         return True, "Recording stopped"
 
-    def _stop_batch(self, take_id: Optional[str]) -> tuple[bool, str]:
-        """Close a batch take's recording and transcribe all of it in the background.
+    async def _stop_batch(self, take_id: Optional[str]) -> tuple[bool, str]:
+        """Seal a batch take and finish it in the background.
 
-        The daemon is idle meanwhile, so a new recording can start; the result
-        still reaches the clipboard.
+        Over the socket when it is up, waiting for the backend's `take_state`;
+        otherwise the finish seals over REST. The daemon is idle meanwhile, so a
+        new recording can start; the text still reaches the clipboard.
         """
+        captured = self._captured_through
+        voice = self.voice if self._uplink_ready and self._uplink_ok else None
+        sealed = False
+        if voice is not None and take_id:
+            try:
+                await voice.close_gate("button", take_id=take_id, captured_samples=captured)
+                sealed = await voice.wait_take_state(take_id, SEAL_WAIT_S) is not None
+            except Exception as e:
+                logger.warning(f"Sealing over the socket failed: {e}")
+        if not sealed and self.voice is not None:
+            with contextlib.suppress(Exception):
+                await self.voice.close()
+            voice = None
+        self.voice = None
+        self._uplink_ready = False
         if self._writer:
             self._writer.finish("", False)
             self._writer = None
         self.state = State.IDLE
-        if take_id is None or self._captured_through == 0:
+        if take_id is None:
             self.emit_state("error", "")
-            return False, "Recording stopped; nothing was captured"
+            return False, "Recording stopped; it had no take"
+        logger.info(f"Batch take {take_id[:8]} {'sealed' if sealed else 'not sealed'} at stop")
         self._finish_task = asyncio.create_task(
-            self._finish_take(take_id, {}, False, None, [], self.current_output_file)
+            self._finish_server_take(take_id, voice, sealed, captured, self.current_output_file)
         )
         return True, "Recording stopped; transcribing"
+
+    def _take_client(self) -> takes.TakeClient:
+        return takes.TakeClient(
+            self.config["pai_cloud"]["socket_url"], lambda: resolve_token(self.config)
+        )
+
+    async def _settle_server_take(
+        self,
+        take_id: str,
+        voice: Optional[VoiceSocketClient],
+        sealed: bool,
+        captured: int,
+    ) -> str:
+        """Seal (if not yet), upload what is missing, and wait for the take's text."""
+        client = self._take_client()
+        deadline = time.monotonic() + FINISH_DEADLINE_S
+        if sealed:
+            view = await asyncio.to_thread(client.get, take_id, deadline)
+        else:
+            view = await asyncio.to_thread(client.seal, take_id, captured, device_name(), deadline)
+        loop = asyncio.get_running_loop()
+        delay = TAKE_POLL_FIRST_S
+        while True:
+            if view.state == "done":
+                return view.text or ""
+            if view.state == "failed":
+                raise takes.PermanentTakeError(f"the backend gave up on it ({view.failure})")
+            if view.missing:
+                await self._upload_missing(client, take_id, view.missing, deadline)
+            if time.monotonic() > deadline:
+                raise ConnectionError(f"no text within {FINISH_DEADLINE_S / 3600:.0f}h")
+            started = loop.time()
+            if voice is not None and await voice.wait_take_done(take_id, delay) is not None:
+                delay = TAKE_POLL_FIRST_S
+            else:
+                # A closed socket answers at once; from then on only the poll is left.
+                if loop.time() - started < delay:
+                    voice = None
+                    await asyncio.sleep(delay - (loop.time() - started))
+                delay = min(delay * 1.5, TAKE_POLL_MAX_S)
+            view = await asyncio.to_thread(client.get, take_id, deadline)
+
+    async def _upload_missing(
+        self,
+        client: takes.TakeClient,
+        take_id: str,
+        missing: list[tuple[int, int]],
+        deadline: float,
+    ) -> None:
+        pcm = recordings.read_pcm(self._recordings_dir, take_id)
+        for start, end in missing:
+            logger.info(f"Uploading samples {start}..{end} into take {take_id[:8]}")
+            piece = pcm[start * 2 : end * 2]
+            await asyncio.to_thread(client.upload, take_id, piece, start, deadline)
+
+    async def _finish_server_take(
+        self,
+        take_id: str,
+        voice: Optional[VoiceSocketClient],
+        sealed: bool,
+        captured: int,
+        output_file: Optional[Path],
+    ) -> None:
+        """Finish a batch take and deliver its text like any other take's."""
+        text, complete = "", False
+        try:
+            text = await self._settle_server_take(take_id, voice, sealed, captured)
+            complete = True
+        except Exception as e:
+            logger.error(
+                f"Batch take {take_id[:8]} did not finish: {e}; "
+                f"'pai-stt retranscribe {take_id[:8]}' transcribes the recording again"
+            )
+            self.play_sound(SOUND_ERROR)
+        finally:
+            if voice is not None:
+                with contextlib.suppress(Exception):
+                    await voice.bye(reason="stop")
+                await voice.close()
+        if complete:
+            recordings.store_transcript(self._recordings_dir, take_id, text, "server")
+            logger.info(f"Batch take {take_id[:8]} done: {len(text)} chars")
+        if output_file is not None:
+            output_file.write_text(text)
+        if self._take_id == take_id and self.state == State.IDLE:
+            self.current_text = text
+            await self._deliver(text, complete)
+        elif text:
+            # A new recording owns the indicator; the clipboard still gets this text.
+            await self.copy_to_clipboard(text)
+
+    async def resume_owed_takes(self) -> None:
+        """Finish batch takes a daemon restart left unfinished; their text is only stored."""
+        now = datetime.now(timezone.utc)
+        for rec in recordings.list_recordings(self._recordings_dir):
+            age = (now - datetime.fromisoformat(rec.started_at)).total_seconds()
+            if rec.mode != "batch" or rec.transcript_complete or age > RESUME_WINDOW_S:
+                continue
+            captured = rec.duration_ms * recordings.SAMPLE_RATE // 1000
+            logger.info(f"Resuming unfinished batch take {rec.id[:8]}")
+            try:
+                text = await self._settle_server_take(rec.id, None, False, captured)
+            except Exception as e:
+                logger.error(f"Unfinished batch take {rec.id[:8]} still did not finish: {e}")
+                continue
+            recordings.store_transcript(self._recordings_dir, rec.id, text, "server")
+            logger.info(f"Batch take {rec.id[:8]} finished after a restart: {len(text)} chars")
 
     async def _deliver(self, text: str, complete: bool) -> None:
         if text:
@@ -1054,6 +1213,8 @@ async def run_daemon() -> None:
 
     daemon = PaiSttDaemon(config)
     await daemon.setup_dbus()
+    # Held on the daemon: an unreferenced task can be collected mid-run.
+    daemon.resume_task = asyncio.create_task(daemon.resume_owed_takes())
 
     SOCKET_PATH.unlink(missing_ok=True)
     server = await asyncio.start_unix_server(

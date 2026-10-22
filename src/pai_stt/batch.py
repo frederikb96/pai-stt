@@ -39,7 +39,7 @@ def pieces(pcm: bytes) -> list[bytes]:
     return out
 
 
-def _multipart(fields: dict[str, str], wav: bytes) -> tuple[bytes, str]:
+def multipart(fields: dict[str, str], wav: bytes) -> tuple[bytes, str]:
     boundary = uuid.uuid4().hex
     body = b""
     for name, value in fields.items():
@@ -66,7 +66,7 @@ def transcribe(
     for piece in pieces(pcm):
         context = f"{previous_text} {text}".strip()
         fields = {"previous_text": context[-PREVIOUS_TEXT_CHARS:]} if context else {}
-        body, content_type = _multipart(fields, wav_header(len(piece)) + piece)
+        body, content_type = multipart(fields, wav_header(len(piece)) + piece)
         request = urllib.request.Request(
             url,
             data=body,

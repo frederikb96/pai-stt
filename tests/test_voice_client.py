@@ -34,6 +34,10 @@ class Server:
                 await ws.send(json.dumps({"type": "ping"}))
             elif msg["type"] == "pong":
                 self.pong.set()
+            elif msg["type"] == "gate" and not msg["open"] and "captured_samples" in msg:
+                seal = {"type": "take_state", "take_id": msg["take_id"], "missing": []}
+                await ws.send(json.dumps({**seal, "state": "open"}))
+                await ws.send(json.dumps({**seal, "state": "sealed"}))
             elif msg["type"] == "gate" and not msg["open"] and self._ended:
                 take_id = next(
                     m["take_id"] for m in self.received if m.get("type") == "gate" and m["open"]
@@ -66,6 +70,32 @@ class TestVoiceClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hello["caps"], {"audio_downlink": False, "silence_gate": True})
         self.assertEqual(hello["device"], {"name": "host", "mic": "Headset"})
         self.assertTrue(client.silence_allowed)
+
+    async def test_a_batch_take_asks_for_a_stored_standalone_take_and_its_seal_is_answered(
+        self,
+    ) -> None:
+        server = Server()
+        async with serve(server.handler, "127.0.0.1", 0) as srv:
+            client = VoiceSocketClient(
+                f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}", "token",
+                VoiceSocketCallbacks(), device_name="host", mic=None, silence_gate=False,
+                take_store=True, stt_mode="batch", standalone=True,
+            )
+            await client.connect()
+            take_id = await client.open_gate(reason="button")
+            await client.close_gate("button", take_id=take_id, captured_samples=48000)
+            state = await client.wait_take_state(take_id, 2)
+            await client.close()
+        hello = server.received[0]
+        self.assertTrue(hello["caps"]["take_store"])
+        self.assertEqual((hello["stt_mode"], hello["standalone"]), ("batch", True))
+        seal = server.received[-1]
+        self.assertEqual(
+            (seal["take_id"], seal["captured_samples"], seal["withheld"]), (take_id, 48000, [])
+        )
+        # The `open` state that precedes the seal does not count as its answer.
+        assert state is not None
+        self.assertEqual(state["state"], "sealed")
 
     async def test_take_done_is_delivered_for_the_take_the_gate_opened(self) -> None:
         server = Server()
