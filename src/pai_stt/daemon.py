@@ -2,11 +2,14 @@
 """pai-stt daemon.
 
 Runs as a systemd user service, listens on a Unix socket for commands from
-the CLI and the GNOME Shell keyboard shortcut. Commands: START, STOP,
-STATUS, TOGGLE.
+the CLI and the GNOME Shell keyboard shortcut. Commands: START, START-BATCH,
+STOP, STATUS, TOGGLE, TOGGLE-BATCH.
 
-Captures the microphone with pw-record and streams it to the PAI Cloud voice
-socket while a recording is open; emits DBus signals for the GNOME extension.
+Captures the microphone with pw-record. A live take streams it to the PAI Cloud
+voice socket while it records; a batch take only records, and its whole local
+recording goes through the backend's batch route after stop. Emits DBus
+signals (state, input level) for the GNOME extension and serves it the past
+recordings.
 `_on_transcript` folds each `transcript` down frame into the take's
 assembled text and delivers it to the clipboard and to a file — see
 `voice_client` for the frame this is wired to and the composition rule it
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -45,7 +49,7 @@ from pai_stt.paths import (
     ensure_output_dir,
 )
 from pai_stt.recordings import RecordingWriter
-from pai_stt.silence_gate import Frame, SilenceGate
+from pai_stt.silence_gate import Frame, SilenceGate, level_db
 from pai_stt.voice_client import VoiceSocketCallbacks, VoiceSocketClient
 
 try:
@@ -191,6 +195,9 @@ def load_config() -> dict[str, Any]:
         sys.exit(1)
 
 
+MODES = ("live", "batch")
+
+
 class State(Enum):
     """Daemon state machine."""
 
@@ -202,38 +209,60 @@ class State(Enum):
 if DBUS_AVAILABLE:
 
     class PaiSttDBusInterface(ServiceInterface):  # type: ignore[misc]
-        """DBus interface for status updates to the GNOME extension.
+        """DBus interface for the GNOME extension.
 
-        Signals carry truncated text for the panel; GetStatus returns the
-        full text on demand for the popup.
+        StateChanged carries the state, truncated text for the panel and the
+        take's mode; GetStatus returns the full text on demand for the popup.
+        Level carries the input level of each captured chunk while recording.
         """
 
-        def __init__(self, text_provider: "Any", copier: "Any") -> None:
+        def __init__(self, daemon: PaiSttDaemon) -> None:
             super().__init__(DBUS_NAME)
+            self._daemon = daemon
             self._state = "idle"
             self._signal_text = ""
-            self._text_provider = text_provider
-            self._copier = copier
+            self._mode = "live"
 
-        # dbus_next reads its DBus signature straight off this string return
-        # annotation ("ss" = two strings, "b" = one boolean) rather than a
-        # real Python type, which is why ruff and mypy both misread it as an
-        # undefined name.
+        # dbus_next reads its DBus signature straight off these string
+        # annotations ("ss" = two strings, "b" = one boolean) rather than a
+        # real Python type, which is why ruff and mypy both misread them as
+        # undefined names.
         @dbus_signal()
-        def StateChanged(self) -> "ss":  # type: ignore[name-defined]  # noqa: N802, F821
-            return [self._state, self._signal_text]
+        def StateChanged(self) -> "sss":  # type: ignore[name-defined]  # noqa: N802, F821
+            return [self._state, self._signal_text, self._mode]
+
+        @dbus_signal()
+        def Level(self, db: float) -> "d":  # type: ignore[name-defined]  # noqa: N802, F821
+            return db
 
         @method()
-        def GetStatus(self) -> "ss":  # type: ignore[name-defined]  # noqa: N802, F821
-            return [self._state, self._text_provider()]
+        def GetStatus(self) -> "sss":  # type: ignore[name-defined]  # noqa: N802, F821
+            return [self._state, self._daemon.current_text, self._mode]
 
         @method()
         async def CopyToClipboard(self) -> "b":  # type: ignore[name-defined]  # noqa: N802, F821
-            return await self._copier()
+            return await self._daemon.copy_current_text()
 
-        def emit_state(self, state: str, text: str = "") -> None:
+        @method()
+        def ListRecordings(self) -> "s":  # type: ignore[name-defined]  # noqa: N802, F821
+            return self._daemon.recordings_json()
+
+        @method()
+        async def CopyRecording(self, rec_id: "s") -> "b":  # type: ignore[name-defined]  # noqa: N802, F821
+            return await self._daemon.copy_recording(rec_id)
+
+        @method()
+        def Retranscribe(self, rec_id: "s") -> "b":  # type: ignore[name-defined]  # noqa: N802, F821
+            return self._daemon.retranscribe(rec_id)
+
+        @method()
+        async def Command(self, command: "s") -> "s":  # type: ignore[name-defined]  # noqa: N802, F821
+            return await self._daemon.handle_command(command)
+
+        def emit_state(self, state: str, text: str, mode: str) -> None:
             self._state = state
             self._signal_text = text
+            self._mode = mode
             self.StateChanged()
 
 
@@ -287,6 +316,8 @@ class PaiSttDaemon:
         self._sent_through = 0
         self._pending: list[Frame] = []
         self._gain_db = 0.0
+        self._mode = "live"
+        self._retranscribing: set[str] = set()
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
 
@@ -297,9 +328,7 @@ class PaiSttDaemon:
             return
         try:
             self.dbus_bus = await MessageBus().connect()
-            self.dbus_interface = PaiSttDBusInterface(
-                lambda: self.current_text, self._copy_current_text
-            )
+            self.dbus_interface = PaiSttDBusInterface(self)
             self.dbus_bus.export(DBUS_PATH, self.dbus_interface)
             await self.dbus_bus.request_name(DBUS_NAME)
             logger.info(f"DBus service registered: {DBUS_NAME}")
@@ -309,7 +338,11 @@ class PaiSttDaemon:
 
     def emit_state(self, state: str, text: str = "") -> None:
         if self.dbus_interface:
-            self.dbus_interface.emit_state(state, text)
+            self.dbus_interface.emit_state(state, text, self._mode)
+
+    def emit_level(self, db: float) -> None:
+        if self.dbus_interface:
+            self.dbus_interface.Level(db)
 
     def play_sound(self, sound_file: Path) -> None:
         """Play a sound file without blocking the event loop."""
@@ -333,11 +366,65 @@ class PaiSttDaemon:
             logger.error(f"Clipboard delivery failed: {e}")
             return False
 
-    async def _copy_current_text(self) -> bool:
+    async def copy_current_text(self) -> bool:
         if not self.current_text:
             logger.info("Copy requested with no transcription available")
             return False
         return await self.copy_to_clipboard(self.current_text)
+
+    def recordings_json(self) -> str:
+        """Past recordings for the extension's list, newest first, as a JSON array."""
+        return json.dumps(
+            [
+                {
+                    "id": rec.id,
+                    "started_at": rec.started_at,
+                    "duration_ms": rec.duration_ms,
+                    "mode": rec.mode,
+                    "transcript": rec.transcript,
+                    "complete": rec.transcript_complete,
+                    "recording": self._writer is not None and self._writer.take_id == rec.id,
+                    "transcribing": rec.id in self._retranscribing,
+                }
+                for rec in recordings.list_recordings(self._recordings_dir)
+            ]
+        )
+
+    async def copy_recording(self, rec_id: str) -> bool:
+        """Copy a past recording's stored transcript to the clipboard."""
+        try:
+            rec = recordings.resolve(self._recordings_dir, rec_id)
+        except LookupError as e:
+            logger.warning(f"Copy of recording {rec_id[:8]} refused: {e}")
+            return False
+        if not rec.transcript:
+            return False
+        return await self.copy_to_clipboard(rec.transcript)
+
+    def retranscribe(self, rec_id: str) -> bool:
+        """Transcribe a past recording again in the background; False if it cannot start.
+
+        The result replaces the stored transcript and goes to the clipboard; the
+        indicator follows it unless a recording is running.
+        """
+        try:
+            rec = recordings.resolve(self._recordings_dir, rec_id)
+        except LookupError as e:
+            logger.warning(f"Re-transcription of {rec_id[:8]} refused: {e}")
+            return False
+        busy = self._writer is not None and self._writer.take_id == rec.id
+        if busy or rec.id in self._retranscribing or rec.duration_ms == 0:
+            return False
+        logger.info(f"Re-transcribing recording {rec.id[:8]}")
+        self._retranscribing.add(rec.id)
+        if self.state == State.IDLE:
+            self._take_id = rec.id
+            self._mode = rec.mode
+            self.current_text = ""
+            self.emit_state("transcribing", "")
+        task = asyncio.create_task(self._finish_take(rec.id, {}, False, None, [], None))
+        task.add_done_callback(lambda _t: self._retranscribing.discard(rec.id))
+        return True
 
     def _write_result_file(self, text: str) -> None:
         if self.current_output_file is None:
@@ -555,19 +642,29 @@ class PaiSttDaemon:
     def _assembled_text(self) -> str:
         return assemble(self._committed_segments, self._partial_text)
 
-    async def start_recording(self) -> tuple[bool, str]:
+    async def start_recording(self, mode: str = "live") -> tuple[bool, str]:
+        """Start a take. A live one streams to the voice socket, a batch one only records.
+
+        A batch take needs no backend until it is transcribed after stop, so it
+        records even with the backend down.
+        """
+        if mode not in MODES:
+            return False, f"Unknown mode: {mode}"
         if self.state != State.IDLE:
             return False, f"Cannot start: state is {self.state.value}"
         # Claim the state before the first await so a second START cannot slip in.
         self.state = State.RECORDING
-        try:
-            token = await asyncio.to_thread(resolve_token, self.config)
-        except TokenError as e:
-            logger.error(f"No bearer token: {e}")
-            self.play_sound(SOUND_ERROR)
-            self.state = State.IDLE
-            return False, f"No bearer token: {e}"
+        token = ""
+        if mode == "live":
+            try:
+                token = await asyncio.to_thread(resolve_token, self.config)
+            except TokenError as e:
+                logger.error(f"No bearer token: {e}")
+                self.play_sound(SOUND_ERROR)
+                self.state = State.IDLE
+                return False, f"No bearer token: {e}"
 
+        self._mode = mode
         self.play_sound(SOUND_START)
         self.emit_state("recording", "")
         self.current_text = ""
@@ -578,7 +675,7 @@ class PaiSttDaemon:
         self._silence_at = None
         self._sent_through = 0
         self._take_id = str(uuid.uuid4())
-        logger.info("Starting recording session")
+        logger.info(f"Starting {mode} recording session")
 
         ensure_output_dir()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -602,14 +699,15 @@ class PaiSttDaemon:
         self._captured_through = 0
         self._backfills = []
         self._pending = []
-        self.voice = VoiceSocketClient(
-            self.config["pai_cloud"]["socket_url"],
-            token,
-            self._voice_callbacks(),
-            device_name=device_name(),
-            mic=default_mic(),
-            silence_gate=gate_config["enabled"],
-        )
+        if mode == "live":
+            self.voice = VoiceSocketClient(
+                self.config["pai_cloud"]["socket_url"],
+                token,
+                self._voice_callbacks(),
+                device_name=device_name(),
+                mic=default_mic(),
+                silence_gate=gate_config["enabled"],
+            )
 
         # Capture and the local recording start first; the connection is made in
         # parallel and the frames captured meanwhile are flushed once it is ready.
@@ -629,8 +727,11 @@ class PaiSttDaemon:
             return False, f"Failed to start audio capture: {e}"
 
         self._recordings_dir = RECORDINGS_DIR
-        self._writer = RecordingWriter(self._recordings_dir, self._take_id)
-        self._connect_task = asyncio.create_task(self._connect_uplink(self.voice, self._take_id))
+        self._writer = RecordingWriter(self._recordings_dir, self._take_id, mode)
+        if self.voice is not None:
+            self._connect_task = asyncio.create_task(
+                self._connect_uplink(self.voice, self._take_id)
+            )
         self.pump_task = asyncio.create_task(self._pump_audio())
         return True, "Recording started"
 
@@ -655,7 +756,10 @@ class PaiSttDaemon:
             await self._feed(self._pending.pop(0))
 
     async def _pump_audio(self) -> None:
-        """Read pw-record's stdout to EOF; record every chunk, send what the gate lets through."""
+        """Read pw-record's stdout to EOF; record every chunk, send what the gate lets through.
+
+        Every chunk's level goes to the extension; only a live take sends audio.
+        """
         assert self.pw_record_proc is not None
         assert self.pw_record_proc.stdout is not None
         stdout = self.pw_record_proc.stdout
@@ -675,8 +779,10 @@ class PaiSttDaemon:
                         self._writer.append(chunk)
                     frame = Frame(sample_offset, apply_gain(chunk, self._gain_db))
                     sample_offset = self._captured_through = frame.end
-                    self._pending.append(frame)
-                    await self._drain_pending()
+                    self.emit_level(level_db(frame.pcm))
+                    if self.voice is not None:
+                        self._pending.append(frame)
+                        await self._drain_pending()
                 if last:
                     break
         except Exception as e:
@@ -763,6 +869,8 @@ class PaiSttDaemon:
             await self._drain_pending()
 
         take_id = self._take_id
+        if self._mode == "batch":
+            return self._stop_batch(take_id)
         ended: Optional[str] = None
         if self.voice and take_id and self._uplink_ready:
             if self._gate:
@@ -810,14 +918,36 @@ class PaiSttDaemon:
         self.state = State.IDLE
         return True, "Recording stopped"
 
+    def _stop_batch(self, take_id: Optional[str]) -> tuple[bool, str]:
+        """Close a batch take's recording and transcribe all of it in the background.
+
+        The daemon is idle meanwhile, so a new recording can start; the result
+        still reaches the clipboard.
+        """
+        if self._writer:
+            self._writer.finish("", False)
+            self._writer = None
+        self.state = State.IDLE
+        if take_id is None or self._captured_through == 0:
+            self.emit_state("error", "")
+            return False, "Recording stopped; nothing was captured"
+        self._finish_task = asyncio.create_task(
+            self._finish_take(take_id, {}, False, None, [], self.current_output_file)
+        )
+        return True, "Recording stopped; transcribing"
+
     async def _deliver(self, text: str, complete: bool) -> None:
         if text:
             await self.copy_to_clipboard(text)
         if text and complete:
             self.play_sound(SOUND_DONE)
             self.emit_state("done", text[-500:])
-        else:
+        elif complete:
+            self.emit_state("empty", "")
+        elif text:
             self.emit_state("partial", text[-500:])
+        else:
+            self.emit_state("error", "")
 
     async def _finish_take(
         self,
@@ -849,7 +979,7 @@ class PaiSttDaemon:
                 complete, source = True, "batch"
         except Exception as e:
             logger.error(
-                f"Transcribing from the recording failed, keeping the live text; "
+                f"Transcribing from the recording failed, keeping what the live text had; "
                 f"'pai-stt retranscribe {take_id[:8]}' tries again: {e}"
             )
             self.play_sound(SOUND_ERROR)
@@ -865,9 +995,10 @@ class PaiSttDaemon:
             # A new recording owns the indicator; the clipboard still gets this text.
             await self.copy_to_clipboard(text)
 
-    async def toggle_recording(self) -> tuple[bool, str]:
+    async def toggle_recording(self, mode: str = "live") -> tuple[bool, str]:
+        """Start a take in `mode` when idle; stop the running one, whatever its mode."""
         if self.state == State.IDLE:
-            return await self.start_recording()
+            return await self.start_recording(mode)
         if self.state == State.RECORDING:
             return await self.stop_recording()
         return False, f"Cannot toggle: state is {self.state.value}"
@@ -879,10 +1010,14 @@ class PaiSttDaemon:
         command = command.strip().upper()
         if command == "START":
             ok, msg = await self.start_recording()
+        elif command == "START-BATCH":
+            ok, msg = await self.start_recording("batch")
         elif command == "STOP":
             ok, msg = await self.stop_recording()
         elif command == "TOGGLE":
             ok, msg = await self.toggle_recording()
+        elif command == "TOGGLE-BATCH":
+            ok, msg = await self.toggle_recording("batch")
         elif command == "STATUS":
             return f"OK {self.status()}"
         else:
@@ -941,7 +1076,7 @@ def command_timeout(command: str, load: Callable[[], dict[str, Any]]) -> float:
 
     `load` reads the config, so only a command that can stop a take needs one.
     """
-    if command.lower() in ("stop", "toggle"):
+    if command.lower() in ("stop", "toggle", "toggle-batch"):
         return float(load()["transcription_timeout"]) + STOP_OVERHEAD_S
     return DEFAULT_COMMAND_TIMEOUT_S
 

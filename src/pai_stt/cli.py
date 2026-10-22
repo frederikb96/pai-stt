@@ -5,9 +5,11 @@ Usage:
     pai-stt setup             Install systemd service and create config
     pai-stt teardown          Remove systemd service
     pai-stt install-extension Install GNOME Shell extension
-    pai-stt start             Start recording
+    pai-stt start             Start a live recording
+    pai-stt start-batch       Start a batch recording (transcribed after stop)
     pai-stt stop               Stop recording
-    pai-stt toggle             Toggle recording (default)
+    pai-stt toggle             Start a live recording, or stop any (default)
+    pai-stt toggle-batch       Start a batch recording, or stop any
     pai-stt status             Check daemon status
     pai-stt recordings         List past recordings (newest first)
     pai-stt transcript <id|last>     Print a past recording's transcript
@@ -235,7 +237,10 @@ def list_recordings(directory: Path) -> int:
         started = datetime.fromisoformat(rec.started_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         flag = "" if rec.transcript_complete else " (incomplete)"
         preview = rec.transcript[:60].replace("\n", " ")
-        print(f"{rec.id[:8]}  {started}  {rec.duration_ms / 1000:7.1f}s{flag}  {preview}")
+        print(
+            f"{rec.id[:8]}  {started}  {rec.mode:5}  {rec.duration_ms / 1000:7.1f}s{flag}  "
+            f"{preview}"
+        )
     return 0
 
 
@@ -301,7 +306,7 @@ def main() -> NoReturn:
         socket_url = config["pai_cloud"]["socket_url"]
         sys.exit(retranscribe(RECORDINGS_DIR, sys.argv[2], socket_url, token))
 
-    if cmd not in ("start", "stop", "status", "toggle"):
+    if cmd not in ("start", "start-batch", "stop", "status", "toggle", "toggle-batch"):
         print(__doc__)
         sys.exit(1)
 

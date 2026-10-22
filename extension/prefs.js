@@ -45,5 +45,12 @@ export default class PaiSttPreferences extends ExtensionPreferences {
       "value",
       Gio.SettingsBindFlags.DEFAULT
     );
+
+    const idleRow = new Adw.SwitchRow({
+      title: "Show When Idle",
+      subtitle: "Keep the icon in the panel between recordings",
+    });
+    appearanceGroup.add(idleRow);
+    settings.bind("show-when-idle", idleRow, "active", Gio.SettingsBindFlags.DEFAULT);
   }
 }

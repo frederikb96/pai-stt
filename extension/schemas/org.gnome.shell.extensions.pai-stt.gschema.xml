@@ -7,5 +7,10 @@
       <summary>Label maximum width</summary>
       <description>Maximum width in pixels for the transcription preview in the panel</description>
     </key>
+    <key name="show-when-idle" type="b">
+      <default>true</default>
+      <summary>Show the indicator when idle</summary>
+      <description>Keep the microphone icon in the panel between recordings, so the menu and the recordings list stay reachable</description>
+    </key>
   </schema>
 </schemalist>

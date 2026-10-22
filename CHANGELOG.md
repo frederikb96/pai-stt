@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Added
+
+- Batch mode (`pai-stt toggle-batch`, `start-batch`): the take is only recorded, then
+  transcribed whole through the backend's batch route after stop and copied to the clipboard.
+  It needs no backend connection while recording. Either toggle stops a running take.
+- GNOME indicator: the recording dot pulses with the microphone level and turns grey with "No
+  input" after three seconds without signal; a batch take shows its elapsed time and a scrolling
+  level history.
+- GNOME popup: the recent recordings with start time, length and mode; a click copies one's
+  transcript, its button transcribes it again. Start and stop items for both modes.
+- `show-when-idle` extension setting (on by default) keeps the icon in the panel between
+  recordings.
+
+### Changed
+
+- The newest 50 recordings are kept instead of 10.
+- The indicator follows the daemon appearing on and leaving the session bus, so a restarted or
+  stopped daemon no longer leaves a stale state; the popup's Refresh item is gone.
+- A take that ends with no words shows "Nothing heard", a failed one "Failed!", instead of
+  "Partial!".
+
 ## [0.2.0] - 2026-10-06
 
 ### Changed

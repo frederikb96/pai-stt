@@ -252,7 +252,7 @@ class TestDaemonReconnect(unittest.IsolatedAsyncioTestCase):
         frames = int(daemon_module.REPLAY_MAX_S * 10) + 50
         with tempfile.TemporaryDirectory() as tmp:
             daemon._recordings_dir = Path(tmp)
-            writer = recordings.RecordingWriter(Path(tmp), "take-1")
+            writer = recordings.RecordingWriter(Path(tmp), "take-1", "live")
             writer.append(bytes(range(256)) * (frames * CHUNK_BYTES // 256))
             daemon._on_transcript("before", True, 0, 0, "take-1")
             daemon._pending = [Frame(i * step, LOUD) for i in range(frames)]

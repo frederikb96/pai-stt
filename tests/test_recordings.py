@@ -13,7 +13,7 @@ from pai_stt.device import parse_mic_description
 
 
 def _record(directory: Path, take_id: str, samples: int, transcript: str = "") -> None:
-    writer = recordings.RecordingWriter(directory, take_id)
+    writer = recordings.RecordingWriter(directory, take_id, "live")
     writer.append(bytes(samples * 2))
     writer.finish(transcript, complete=True)
 
@@ -25,22 +25,28 @@ class TestRecordings(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def test_wav_is_valid_after_every_append(self) -> None:
-        writer = recordings.RecordingWriter(self.dir, "a")
+        writer = recordings.RecordingWriter(self.dir, "a", "live")
         writer.append(bytes(3200))
         data = (self.dir / "a.wav").read_bytes()
         self.assertEqual(data[:4], b"RIFF")
         self.assertEqual(int.from_bytes(data[40:44], "little"), 3200)
         self.assertEqual(len(data), 44 + 3200)
 
-    def test_only_the_newest_ten_survive(self) -> None:
-        for i in range(12):
-            _record(self.dir, f"take-{i:02d}", 1600)
+    def test_only_the_newest_survive(self) -> None:
+        with unittest.mock.patch.object(recordings, "KEEP_RECORDINGS", 3):
+            for i in range(5):
+                _record(self.dir, f"take-{i:02d}", 1600)
         kept = [r.id for r in recordings.list_recordings(self.dir)]
-        self.assertEqual(len(kept), 10)
-        self.assertNotIn("take-00", kept)
-        self.assertNotIn("take-01", kept)
-        self.assertEqual(kept[0], "take-11")
-        self.assertEqual(len(list(self.dir.glob("*.wav"))), 10)
+        self.assertEqual(kept, ["take-04", "take-03", "take-02"])
+        self.assertEqual(len(list(self.dir.glob("*.wav"))), 3)
+
+    def test_a_sidecar_without_a_mode_reads_as_live(self) -> None:
+        _record(self.dir, "old", 1600)
+        sidecar = self.dir / "old.json"
+        meta = json.loads(sidecar.read_text())
+        del meta["mode"]
+        sidecar.write_text(json.dumps(meta))
+        self.assertEqual(recordings.list_recordings(self.dir)[0].mode, "live")
 
     def test_resolve_last_and_prefix(self) -> None:
         _record(self.dir, "abc111", 1600)

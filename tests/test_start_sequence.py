@@ -1,6 +1,7 @@
 """Start sequence: capture and the local recording begin before the socket is ready."""
 
 import asyncio
+import json
 import struct
 import tempfile
 import unittest
@@ -77,7 +78,7 @@ class SlowVoice:
         self.calls.append("close")
 
 
-class TestStartSequence(unittest.IsolatedAsyncioTestCase):
+class DaemonHarness(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -85,20 +86,34 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
         self.pw = LivePwRecord()
         self.spawned: list[list[str]] = []
 
-    async def _start(self, voice: SlowVoice, gain_db: float = 0) -> PaiSttDaemon:
+    async def _start(
+        self, voice: Optional[SlowVoice], gain_db: float = 0, mode: str = "live"
+    ) -> PaiSttDaemon:
+        """Start a take; `voice` None makes any voice socket the daemon creates an error."""
+        self.copied: list[str] = []
+        self.states: list[str] = []
+
+        def make_voice(*_a: Any, **_k: Any) -> SlowVoice:
+            if voice is None:
+                raise AssertionError("a voice socket was created")
+            return voice
+
         daemon = PaiSttDaemon(
             {
                 "transcription_timeout": 5,
-                "token_command": "sh -c 'printf fake-token'",
+                "token_command": "sh -c 'printf fake-token'" if voice else "false",
                 "pai_cloud": {"socket_url": "wss://example/socket"},
                 "silence_gate": {"enabled": False, "mode": "auto", "manual_threshold_db": -45},
                 "capture": {"gain_db": gain_db},
             }
         )
         daemon.play_sound = lambda _f: None  # type: ignore[method-assign]
-        daemon.emit_state = lambda *_a: None  # type: ignore[method-assign]
+        daemon.emit_state = (  # type: ignore[method-assign]
+            lambda state, *_a: self.states.append(state)
+        )
 
-        async def copy(_text: str) -> bool:
+        async def copy(text: str) -> bool:
+            self.copied.append(text)
             return True
 
         daemon.copy_to_clipboard = copy  # type: ignore[method-assign]
@@ -117,12 +132,12 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
             unittest.mock.patch.object(daemon_module, "STOP_TAIL_S", 0.01),
             unittest.mock.patch.object(daemon_module, "_pw_record_supports_raw", lambda: True),
             unittest.mock.patch.object(daemon_module.asyncio, "create_subprocess_exec", spawn),
-            unittest.mock.patch.object(daemon_module, "VoiceSocketClient", lambda *_a, **_k: voice),
+            unittest.mock.patch.object(daemon_module, "VoiceSocketClient", make_voice),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        ok, msg = await daemon.start_recording()
+        ok, msg = await daemon.start_recording(mode)
         self.assertTrue(ok, msg)
         return daemon
 
@@ -130,6 +145,8 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
         for _ in range(5):
             await asyncio.sleep(0)
 
+
+class TestStartSequence(DaemonHarness):
     async def test_capture_is_started_with_the_raw_flag_so_no_header_reaches_the_pump(self) -> None:
         voice = SlowVoice(fail=False)
         voice.release.set()
@@ -208,6 +225,97 @@ class TestStartSequence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec.duration_ms, 400)
         mark = daemon_module.INTERRUPTED_MARK
         self.assertEqual(rec.transcript, f"{mark} {CHUNK_BYTES * 4} bytes")
+
+
+
+class TestBatchTake(DaemonHarness):
+    async def test_a_batch_take_records_without_the_backend_and_transcribes_all_of_it_at_stop(
+        self,
+    ) -> None:
+        daemon = await self._start(None, mode="batch")
+        self.pw.stdout.feed_data(bytes(CHUNK_BYTES * 3))
+        await self._settle()
+        # Nothing is queued for a socket that never comes: a long take would hold it all.
+        self.assertEqual(daemon._pending, [])
+        requests: list[int] = []
+
+        def transcribe(pcm: bytes, *_a: str) -> str:
+            requests.append(len(pcm))
+            return "batch words"
+
+        with (
+            unittest.mock.patch.object(daemon_module.batch, "transcribe", transcribe),
+            unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "token"),
+        ):
+            ok, _ = await daemon.stop_recording()
+            self.assertTrue(ok)
+            self.assertEqual(daemon.state, State.IDLE)
+            assert daemon._finish_task is not None
+            await daemon._finish_task
+        self.assertEqual(requests, [CHUNK_BYTES * 3])
+        self.assertEqual(self.copied, ["batch words"])
+        self.assertEqual(self.states[-1], "done")
+        (rec,) = recordings.list_recordings(self.dir)
+        self.assertEqual(
+            (rec.mode, rec.transcript, rec.transcript_source), ("batch", "batch words", "batch")
+        )
+        self.assertTrue(rec.transcript_complete)
+
+    async def test_a_failed_batch_reports_an_error_and_keeps_the_recording_for_a_retry(
+        self,
+    ) -> None:
+        daemon = await self._start(None, mode="batch")
+        self.pw.stdout.feed_data(bytes(CHUNK_BYTES * 2))
+        await self._settle()
+
+        def down(*_a: Any) -> str:
+            raise ConnectionError("backend down")
+
+        with (
+            unittest.mock.patch.object(daemon_module.batch, "transcribe", down),
+            unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "token"),
+        ):
+            await daemon.stop_recording()
+            assert daemon._finish_task is not None
+            await daemon._finish_task
+            self.assertEqual((self.copied, self.states[-1]), ([], "error"))
+            (rec,) = recordings.list_recordings(self.dir)
+            self.assertFalse(rec.transcript_complete)
+
+            with unittest.mock.patch.object(
+                daemon_module.batch, "transcribe", lambda *_a: "second try"
+            ):
+                self.assertTrue(daemon.retranscribe(rec.id[:8]))
+                await self._settle()
+                for _ in range(20):
+                    if not daemon._retranscribing:
+                        break
+                    await asyncio.sleep(0.01)
+        self.assertEqual(self.copied, ["second try"])
+        self.assertEqual(recordings.list_recordings(self.dir)[0].transcript, "second try")
+
+    async def test_the_batch_shortcut_stops_a_live_take(self) -> None:
+        voice = SlowVoice(fail=False)
+        voice.release.set()
+        daemon = await self._start(voice)
+        self.pw.stdout.feed_data(bytes(CHUNK_BYTES))
+        await self._settle()
+        reply = await daemon.handle_command("toggle-batch")
+        self.assertTrue(reply.startswith("OK"), reply)
+        self.assertEqual(daemon.state, State.IDLE)
+        self.assertIn("close_gate", voice.calls)
+
+    async def test_the_recording_being_written_cannot_be_retranscribed(self) -> None:
+        daemon = await self._start(None, mode="batch")
+        self.pw.stdout.feed_data(bytes(CHUNK_BYTES))
+        await self._settle()
+        (rec,) = recordings.list_recordings(self.dir)
+        self.assertFalse(daemon.retranscribe(rec.id))
+        listed = json.loads(daemon.recordings_json())
+        self.assertTrue(listed[0]["recording"])
+        await daemon.stop_recording()
+        if daemon._finish_task:
+            daemon._finish_task.cancel()
 
 
 if __name__ == "__main__":
