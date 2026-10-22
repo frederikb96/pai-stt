@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-22
+
 ### Changed
 
 - Batch mode streams the take to the backend while recording, as a server-owned take
