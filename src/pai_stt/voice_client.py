@@ -12,6 +12,11 @@ attach this bus to its transcription-only engine and route transcribed text
 back as `transcript` frames instead of trying to speak it — there is no
 separate opt-in.
 
+A client that declares `caps.take_store` addresses its take by `take_id` on
+`gate` open and close; the close carries the seal (`captured_samples`,
+`withheld`) and is answered with `take_state`. A batch take additionally sets
+`stt_mode: "batch"` and `standalone` on `hello`.
+
 `connect()` starts the receive loop as a task this client owns and returns
 once `ready` has arrived, so the liveness `ping` is answered for as long as
 the connection lives. Every audio frame is held until its `ack` arrives; a
@@ -106,12 +111,20 @@ class VoiceSocketClient:
         device_name: str,
         mic: Optional[str],
         silence_gate: bool,
+        take_store: bool = False,
+        stt_mode: Optional[str] = None,
+        standalone: bool = False,
     ) -> None:
         self._url = url
         self._token = token
         self._callbacks = callbacks
         self._device = {"name": device_name, "mic": mic}
         self._silence_gate = silence_gate
+        self._take_store = take_store
+        self._stt_mode = stt_mode
+        self._standalone = standalone
+        self._phase: Optional[str] = None
+        self._take_states: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._ws: Optional[websockets.ClientConnection] = None
         self._seq = 0
         self._resume_token: Optional[str] = None
@@ -126,6 +139,11 @@ class VoiceSocketClient:
     def silence_allowed(self) -> bool:
         """The backend's latest `silence_allowed` (false until it says otherwise)."""
         return self._silence_allowed
+
+    @property
+    def phase(self) -> Optional[str]:
+        """The engine phase from the latest `state` (`capturing` for a batch take)."""
+        return self._phase
 
     @property
     def resume_token(self) -> Optional[str]:
@@ -148,15 +166,24 @@ class VoiceSocketClient:
         # The previous socket's close resolved these with None; a take still
         # open on this connection waits for its receipt afresh.
         self._take_futures = {k: f for k, f in self._take_futures.items() if not f.done()}
+        self._take_states = {k: f for k, f in self._take_states.items() if not f.done()}
+        self._phase = None
+        caps: dict[str, Any] = {"audio_downlink": False, "silence_gate": self._silence_gate}
+        if self._take_store:
+            caps["take_store"] = True
         hello: dict[str, Any] = {
             "type": "hello",
             "transport": TRANSPORT_NAME,
             # No audio downlink: this client only ever writes transcribed
             # text, never plays synthesised speech back.
-            "caps": {"audio_downlink": False, "silence_gate": self._silence_gate},
+            "caps": caps,
             "device": self._device,
             "auth": self._token,
         }
+        if self._standalone:
+            hello["standalone"] = True
+        if self._stt_mode:
+            hello["stt_mode"] = self._stt_mode
         if resume_token:
             hello["resume_token"] = resume_token
         await self._ws.send(json.dumps(hello))
@@ -185,6 +212,9 @@ class VoiceSocketClient:
             for future in self._take_futures.values():
                 if not future.done():
                     future.set_result(None)
+            for state in self._take_states.values():
+                if not state.done():
+                    state.cancel()
             self._callbacks.on_closed()
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
@@ -203,7 +233,13 @@ class VoiceSocketClient:
             self._callbacks.on_ack(through_seq)
         elif msg_type == "state":
             self._silence_allowed = bool(msg.get("silence_allowed", False))
+            self._phase = msg.get("phase")
             self._callbacks.on_state(msg)
+        elif msg_type == "take_state":
+            # Past `open` means the seal is persisted.
+            take_state = self._take_states.get(msg.get("take_id", ""))
+            if take_state is not None and not take_state.done() and msg.get("state") != "open":
+                take_state.set_result(msg)
         elif msg_type == "notice":
             self._callbacks.on_notice(msg)
         elif msg_type == "clear":
@@ -237,9 +273,31 @@ class VoiceSocketClient:
         self._seq = 0
         return take_id
 
-    async def close_gate(self, reason: str) -> None:
-        """Declare that this take has ended."""
-        await self._send_json({"type": "gate", "open": False, "reason": reason})
+    async def close_gate(
+        self,
+        reason: str,
+        take_id: Optional[str] = None,
+        captured_samples: Optional[int] = None,
+    ) -> None:
+        """Declare that this take has ended; with `captured_samples` the close is its seal."""
+        gate: dict[str, Any] = {"type": "gate", "open": False, "reason": reason}
+        if take_id is not None:
+            gate["take_id"] = take_id
+        if captured_samples is not None:
+            gate["captured_samples"] = captured_samples
+            gate["withheld"] = []
+            self._take_states.setdefault(take_id or "", asyncio.get_running_loop().create_future())
+        await self._send_json(gate)
+
+    async def wait_take_state(self, take_id: str, timeout: float) -> Optional[dict[str, Any]]:
+        """The `take_state` answering this take's seal, or None on timeout or a closed socket."""
+        future = self._take_states.get(take_id)
+        if future is None:
+            return None
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
 
     async def send_silence(self, at_sample: int) -> None:
         """Declare that audio is being withheld from `at_sample` on; the take continues."""

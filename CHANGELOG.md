@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Changed
+
+- Batch mode streams the take to the backend while recording, as a server-owned take
+  (`stt_mode: batch`, `caps.take_store`), instead of uploading the recording after stop. Stop
+  seals the take; audio the server did not receive (an outage, a backend that answered with a
+  live engine) is uploaded from the local recording, and the text is read from the finished take.
+  A batch take left unfinished by a daemon restart is finished at the next start.
+- The silence gate applies to live takes only; a batch take sends all its audio.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pai_stt import daemon as daemon_module
-from pai_stt import recordings
+from pai_stt import recordings, takes
 from pai_stt.daemon import CHUNK_BYTES, PaiSttDaemon, State
 from pai_stt.voice_client import TakeDone
 
@@ -227,72 +227,170 @@ class TestStartSequence(DaemonHarness):
         self.assertEqual(rec.transcript, f"{mark} {CHUNK_BYTES * 4} bytes")
 
 
+class BatchVoice(SlowVoice):
+    """A socket that holds a batch take: the seal is answered unless `seal_answered` is false."""
+
+    def __init__(self, fail: bool, phase: str = "capturing", seal_answered: bool = True) -> None:
+        super().__init__(fail)
+        self.release.set()
+        self.phase = phase
+        self.seal_answered = seal_answered
+        self.sealed_at: Optional[int] = None
+
+    async def close_gate(
+        self, reason: str, take_id: Optional[str] = None, captured_samples: Optional[int] = None
+    ) -> None:
+        self.calls.append("close_gate")
+        self.sealed_at = captured_samples
+
+    async def wait_take_state(self, take_id: str, timeout: float) -> Optional[dict[str, Any]]:
+        return {"state": "sealed"} if self.seal_answered else None
+
+    async def wait_take_done(self, take_id: str, timeout: float) -> Optional[TakeDone]:
+        return None
+
+
+class FakeTakes:
+    """The backend's take routes: a take that reports `missing` until uploaded, then a text."""
+
+    def __init__(self, text: str = "server words", state: str = "done") -> None:
+        self.text = text
+        self.final_state = state
+        self.captured: Optional[int] = None
+        self.received: list[tuple[int, int]] = []
+        self.calls: list[str] = []
+
+    def _view(self) -> takes.TakeView:
+        assert self.captured is not None
+        missing = [] if self.received else ([(0, self.captured)] if self.captured else [])
+        state = self.final_state if not missing else "sealed"
+        text = self.text if state == "done" else None
+        return takes.TakeView(state, missing, text, None, None)
+
+    def get(self, take_id: str, deadline: float) -> takes.TakeView:
+        self.calls.append("get")
+        return self._view()
+
+    def seal(self, take_id: str, captured: int, device: str, deadline: float) -> takes.TakeView:
+        self.calls.append("seal")
+        self.captured = captured
+        return self._view()
+
+    def upload(self, take_id: str, pcm: bytes, start: int, deadline: float) -> None:
+        self.calls.append("upload")
+        self.received.append((start, start + len(pcm) // 2))
+
 
 class TestBatchTake(DaemonHarness):
-    async def test_a_batch_take_records_without_the_backend_and_transcribes_all_of_it_at_stop(
+    def setUp(self) -> None:
+        super().setUp()
+        for name, value in (
+            ("TAKE_POLL_FIRST_S", 0.01),
+            ("TAKE_POLL_MAX_S", 0.05),
+            # A take that never completes fails the test instead of hanging it.
+            ("FINISH_DEADLINE_S", 3),
+        ):
+            patch = unittest.mock.patch.object(daemon_module, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    async def _record_batch(
+        self, voice: SlowVoice, server: FakeTakes, chunks: int = 3
+    ) -> PaiSttDaemon:
+        daemon = await self._start(voice, mode="batch")
+        daemon._take_client = lambda: server  # type: ignore[assignment, method-assign, return-value]
+        self.pw.stdout.feed_data(bytes(CHUNK_BYTES * chunks))
+        await self._settle()
+        return daemon
+
+    async def _stop(self, daemon: PaiSttDaemon) -> tuple[bool, str]:
+        result = await daemon.stop_recording()
+        self.assertEqual(daemon.state, State.IDLE)
+        assert daemon._finish_task is not None
+        await daemon._finish_task
+        return result
+
+    async def test_a_take_sealed_over_the_socket_needs_no_upload_and_its_text_is_delivered(
         self,
     ) -> None:
-        daemon = await self._start(None, mode="batch")
-        self.pw.stdout.feed_data(bytes(CHUNK_BYTES * 3))
-        await self._settle()
-        # Nothing is queued for a socket that never comes: a long take would hold it all.
-        self.assertEqual(daemon._pending, [])
-        requests: list[int] = []
-
-        def transcribe(pcm: bytes, *_a: str) -> str:
-            requests.append(len(pcm))
-            return "batch words"
-
-        with (
-            unittest.mock.patch.object(daemon_module.batch, "transcribe", transcribe),
-            unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "token"),
-        ):
-            ok, _ = await daemon.stop_recording()
-            self.assertTrue(ok)
-            self.assertEqual(daemon.state, State.IDLE)
-            assert daemon._finish_task is not None
-            await daemon._finish_task
-        self.assertEqual(requests, [CHUNK_BYTES * 3])
-        self.assertEqual(self.copied, ["batch words"])
-        self.assertEqual(self.states[-1], "done")
+        voice, server = BatchVoice(fail=False), FakeTakes()
+        daemon = await self._record_batch(voice, server)
+        server.captured = CHUNK_BYTES * 3 // 2
+        server.received = [(0, server.captured)]
+        await self._stop(daemon)
+        self.assertEqual(voice.sealed_at, CHUNK_BYTES * 3 // 2)
+        self.assertEqual(
+            [c for c in voice.calls if c.startswith("audio")][-1], f"audio@{CHUNK_BYTES}"
+        )
+        self.assertNotIn("seal", server.calls)
+        self.assertNotIn("upload", server.calls)
+        self.assertEqual((self.copied, self.states[-1]), (["server words"], "done"))
         (rec,) = recordings.list_recordings(self.dir)
         self.assertEqual(
-            (rec.mode, rec.transcript, rec.transcript_source), ("batch", "batch words", "batch")
+            (rec.mode, rec.transcript, rec.transcript_source), ("batch", "server words", "server")
         )
         self.assertTrue(rec.transcript_complete)
 
-    async def test_a_failed_batch_reports_an_error_and_keeps_the_recording_for_a_retry(
+    async def test_with_the_socket_down_the_take_is_sealed_over_rest_and_uploaded_whole(
         self,
     ) -> None:
-        daemon = await self._start(None, mode="batch")
+        server = FakeTakes()
+        daemon = await self._record_batch(BatchVoice(fail=True), server)
+        await self._stop(daemon)
+        self.assertEqual(server.calls[:2], ["seal", "upload"])
+        self.assertEqual(
+            (server.captured, server.received), (CHUNK_BYTES * 3 // 2, [(0, CHUNK_BYTES * 3 // 2)])
+        )
+        self.assertEqual(self.copied, ["server words"])
+
+    async def test_a_backend_answering_with_a_live_engine_is_dropped_and_rest_takes_over(
+        self,
+    ) -> None:
+        voice, server = BatchVoice(fail=False, phase="dictating"), FakeTakes()
+        daemon = await self._record_batch(voice, server, chunks=0)
+        daemon._on_state({"phase": "dictating"})
         self.pw.stdout.feed_data(bytes(CHUNK_BYTES * 2))
         await self._settle()
+        await self._stop(daemon)
+        self.assertIsNone(voice.sealed_at)
+        self.assertEqual(server.calls[:2], ["seal", "upload"])
+        self.assertEqual(server.received, [(0, CHUNK_BYTES)])
 
-        def down(*_a: Any) -> str:
-            raise ConnectionError("backend down")
-
+    async def test_a_failed_take_reports_an_error_and_keeps_the_recording_for_a_retry(
+        self,
+    ) -> None:
+        server = FakeTakes(state="failed")
+        daemon = await self._record_batch(BatchVoice(fail=True), server, chunks=2)
+        await self._stop(daemon)
+        self.assertEqual((self.copied, self.states[-1]), ([], "error"))
+        (rec,) = recordings.list_recordings(self.dir)
+        self.assertFalse(rec.transcript_complete)
         with (
-            unittest.mock.patch.object(daemon_module.batch, "transcribe", down),
+            unittest.mock.patch.object(daemon_module.batch, "transcribe", lambda *_a: "second try"),
             unittest.mock.patch.object(daemon_module, "resolve_token", lambda _c: "token"),
         ):
-            await daemon.stop_recording()
-            assert daemon._finish_task is not None
-            await daemon._finish_task
-            self.assertEqual((self.copied, self.states[-1]), ([], "error"))
-            (rec,) = recordings.list_recordings(self.dir)
-            self.assertFalse(rec.transcript_complete)
-
-            with unittest.mock.patch.object(
-                daemon_module.batch, "transcribe", lambda *_a: "second try"
-            ):
-                self.assertTrue(daemon.retranscribe(rec.id[:8]))
-                await self._settle()
-                for _ in range(20):
-                    if not daemon._retranscribing:
-                        break
-                    await asyncio.sleep(0.01)
+            self.assertTrue(daemon.retranscribe(rec.id[:8]))
+            for _ in range(50):
+                if not daemon._retranscribing:
+                    break
+                await asyncio.sleep(0.01)
         self.assertEqual(self.copied, ["second try"])
-        self.assertEqual(recordings.list_recordings(self.dir)[0].transcript, "second try")
+
+    async def test_an_unfinished_recent_batch_take_is_finished_at_startup(self) -> None:
+        server = FakeTakes(text="later words")
+        daemon = await self._record_batch(BatchVoice(fail=True), server, chunks=2)
+        # The daemon dies before the finish runs: the recording is written, the take owed.
+        assert daemon._writer is not None
+        daemon._writer.finish("", False)
+        live = recordings.RecordingWriter(self.dir, "live-take", "live")
+        live.append(bytes(CHUNK_BYTES))
+        live.finish("", False)
+        await daemon.resume_owed_takes()
+        by_mode = {r.mode: r for r in recordings.list_recordings(self.dir)}
+        self.assertEqual(by_mode["batch"].transcript, "later words")
+        self.assertFalse(by_mode["live"].transcript_complete)
+        self.assertEqual(server.received, [(0, CHUNK_BYTES)])
+        self.assertEqual(self.copied, [])
 
     async def test_the_batch_shortcut_stops_a_live_take(self) -> None:
         voice = SlowVoice(fail=False)
@@ -306,16 +404,10 @@ class TestBatchTake(DaemonHarness):
         self.assertIn("close_gate", voice.calls)
 
     async def test_the_recording_being_written_cannot_be_retranscribed(self) -> None:
-        daemon = await self._start(None, mode="batch")
-        self.pw.stdout.feed_data(bytes(CHUNK_BYTES))
-        await self._settle()
+        daemon = await self._record_batch(BatchVoice(fail=False), FakeTakes(), chunks=1)
         (rec,) = recordings.list_recordings(self.dir)
         self.assertFalse(daemon.retranscribe(rec.id))
-        listed = json.loads(daemon.recordings_json())
-        self.assertTrue(listed[0]["recording"])
-        await daemon.stop_recording()
-        if daemon._finish_task:
-            daemon._finish_task.cancel()
+        self.assertTrue(json.loads(daemon.recordings_json())[0]["recording"])
 
 
 if __name__ == "__main__":

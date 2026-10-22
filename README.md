@@ -12,9 +12,11 @@ the parts underneath it — the daemon shape, the GNOME extension, the wire prot
 worth reading and reusing, and because a public repository gets unmetered CI.
 
 **Features:**
-- Two modes: **live** streams microphone audio to a PAI Cloud voice socket while recording;
-  **batch** only records, then transcribes the whole recording through the backend's batch route
-  after stop (no connection needed while recording)
+- Two modes, both streaming microphone audio to a PAI Cloud voice socket: **live** is transcribed
+  while you speak; **batch** is stored by the backend as a take and transcribed after stop (by a
+  backend set up for it, already during pauses). A batch take keeps recording when the backend is
+  unreachable; whatever it did not receive is uploaded from the local recording afterwards, and a
+  take a daemon restart left unfinished is finished at the next start
 - Automatic clipboard copy on completion, verified by reading the clipboard back
 - GNOME panel indicator with full-text popup; the live line always shows the end of the transcript,
   the recording dot pulses with the microphone level, and a batch take shows its elapsed time and a
@@ -59,8 +61,8 @@ pai-stt retranscribe <id|last>   # Transcribe a past recording again via the bac
 ```
 
 Either toggle stops a running recording, whichever mode it was started in. A batch take's text
-reaches the clipboard once the backend has transcribed it, a few seconds to a minute after stop
-depending on its length.
+reaches the clipboard once the backend has finished the take; how long that takes after stop
+depends on the backend and on how much of the take it transcribed while you spoke.
 
 Recordings live in `~/.local/share/pai-stt/recordings/` as a 16 kHz WAV plus a JSON sidecar
 each; an id is the full take id or any unique prefix.
