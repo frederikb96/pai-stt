@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-22
+
 ### Added
 
 - Batch mode (`pai-stt toggle-batch`, `start-batch`): the take is only recorded, then
