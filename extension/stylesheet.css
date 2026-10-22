@@ -29,6 +29,75 @@
   color: #ff6b6b;
 }
 
+.panel-status-menu-box.empty .system-status-icon,
+.panel-status-menu-box.offline .system-status-icon,
+.panel-status-menu-box.recording.no-signal .system-status-icon {
+  color: #8a8a8a;
+}
+
+/* Level history of a batch take; bars are drawn in this colour */
+.pai-stt-wave {
+  margin-left: 6px;
+  height: 16px;
+  color: #ff6b6b;
+}
+
+/* Recordings list in the popup */
+.pai-stt-list {
+  max-height: 360px;
+  width: 400px;
+}
+
+.pai-stt-rec-row {
+  spacing: 4px;
+}
+
+.pai-stt-rec-main {
+  padding: 6px 8px;
+  border-radius: 6px;
+  text-align: left;
+}
+
+.pai-stt-rec-main:hover,
+.pai-stt-rec-main:focus,
+.pai-stt-rec-action:hover,
+.pai-stt-rec-action:focus {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.pai-stt-rec-main:insensitive {
+  color: #8a8a8a;
+}
+
+.pai-stt-rec-action {
+  padding: 6px;
+  border-radius: 6px;
+}
+
+.pai-stt-rec-action:insensitive {
+  color: #5a5a5a;
+}
+
+.pai-stt-rec-meta {
+  font-size: 10px;
+  color: #a8a8a8;
+}
+
+.pai-stt-rec-text {
+  font-size: 12px;
+  color: #eeeeee;
+}
+
+.pai-stt-rec-text.missing {
+  font-style: italic;
+  color: #a8a8a8;
+}
+
+.pai-stt-rec-note {
+  padding: 8px;
+  color: #a8a8a8;
+}
+
 /* Popup scroll container */
 .pai-stt-scroll {
   background-color: rgba(0, 0, 0, 0.2);

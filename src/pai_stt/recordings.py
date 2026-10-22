@@ -2,8 +2,8 @@
 
 Every take is written as `<take_id>.wav` (16 kHz mono PCM16, header patched
 on each append so a crash leaves a playable file) next to a `<take_id>.json`
-sidecar holding the transcript and where it came from. The newest
-`KEEP_RECORDINGS` are kept. The duration is never stored: the WAV is its one
+sidecar holding the mode it was recorded in, the transcript and where it
+came from. The newest `KEEP_RECORDINGS` are kept. The duration is never stored: the WAV is its one
 source.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 SAMPLE_RATE = 16000
-KEEP_RECORDINGS = 10
+KEEP_RECORDINGS = 50
 WAV_HEADER_BYTES = 44
 
 
@@ -38,6 +38,7 @@ class Recording:
     id: str
     started_at: str
     duration_ms: int
+    mode: str
     transcript: str
     transcript_source: str
     transcript_complete: bool
@@ -60,7 +61,7 @@ def _write_sidecar(directory: Path, rec_id: str, meta: dict[str, object]) -> Non
 class RecordingWriter:
     """Appends one take's captured audio to disk."""
 
-    def __init__(self, directory: Path, take_id: str) -> None:
+    def __init__(self, directory: Path, take_id: str, mode: str) -> None:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._directory = directory
         self.take_id = take_id
@@ -70,6 +71,7 @@ class RecordingWriter:
         self._file.flush()
         self._meta: dict[str, object] = {
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "mode": mode,
             "transcript": "",
             "transcript_source": "live",
             "transcript_complete": False,
@@ -97,7 +99,7 @@ class RecordingWriter:
             transcript=transcript, transcript_source="live", transcript_complete=complete
         )
         _write_sidecar(self._directory, self.take_id, self._meta)
-        prune(self._directory)
+        prune(self._directory, KEEP_RECORDINGS)
 
 
 def list_recordings(directory: Path) -> list[Recording]:
@@ -114,6 +116,8 @@ def list_recordings(directory: Path) -> list[Recording]:
                 id=sidecar.stem,
                 started_at=meta["started_at"],
                 duration_ms=samples * 1000 // SAMPLE_RATE,
+                # Recordings from before batch mode existed were all live.
+                mode=meta.get("mode", "live"),
                 transcript=meta["transcript"],
                 transcript_source=meta["transcript_source"],
                 transcript_complete=meta["transcript_complete"],
@@ -142,7 +146,7 @@ def store_transcript(directory: Path, rec_id: str, transcript: str, source: str)
     _write_sidecar(directory, rec_id, meta)
 
 
-def prune(directory: Path, keep: int = KEEP_RECORDINGS) -> None:
+def prune(directory: Path, keep: int) -> None:
     """Delete everything but the newest `keep` recordings."""
     for rec in list_recordings(directory)[keep:]:
         _wav(directory, rec.id).unlink(missing_ok=True)

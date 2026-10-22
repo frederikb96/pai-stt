@@ -87,7 +87,7 @@ async def _stop(
     daemon._uplink_ready = tail_start is None
     daemon._tail_start = tail_start
     daemon._recordings_dir = directory
-    daemon._writer = recordings.RecordingWriter(directory, "take-1")
+    daemon._writer = recordings.RecordingWriter(directory, "take-1", "live")
     daemon.state = State.RECORDING
     daemon.pump_task = asyncio.create_task(daemon._pump_audio())
     daemon.play_sound = lambda _f: None  # type: ignore[method-assign]

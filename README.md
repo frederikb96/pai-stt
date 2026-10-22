@@ -12,9 +12,13 @@ the parts underneath it — the daemon shape, the GNOME extension, the wire prot
 worth reading and reusing, and because a public repository gets unmetered CI.
 
 **Features:**
-- Stream microphone audio to a PAI Cloud voice socket while recording
+- Two modes: **live** streams microphone audio to a PAI Cloud voice socket while recording;
+  **batch** only records, then transcribes the whole recording through the backend's batch route
+  after stop (no connection needed while recording)
 - Automatic clipboard copy on completion, verified by reading the clipboard back
-- GNOME panel indicator with full-text popup; the live line always shows the end of the transcript
+- GNOME panel indicator with full-text popup; the live line always shows the end of the transcript,
+  the recording dot pulses with the microphone level, and a batch take shows its elapsed time and a
+  scrolling level history
 - Client-side silence gate: after a quiet stretch audio stops being sent (the backend keeps the
   session open); the last second is sent first when speech resumes. Auto mode adapts to the room.
 - Stop waits for the backend's receipt that the take is finished, so the last words arrive
@@ -22,7 +26,7 @@ worth reading and reusing, and because a public repository gets unmetered CI.
   unacknowledged and queued audio is sent again. Audio the live text missed during a longer
   outage (a backend restart) is transcribed from the local recording and inserted between
   `STT-INTERRUPTED` markers; if the backend is still down at stop, the rest follows one marker
-- Past recordings on disk (newest 10) with commands to list, print and re-transcribe them
+- Past recordings on disk (newest 50) with commands and a panel list to copy and re-transcribe them
 - No local speech-to-text credentials — authentication is a single bearer token for the backend
 
 ## Installation
@@ -42,15 +46,21 @@ token is never stored in the config file, the environment or the service unit.
 ## Usage
 
 ```bash
-pai-stt toggle    # Start/stop recording (bind this to a keyboard shortcut)
-pai-stt status    # Check if daemon is running
-pai-stt start     # Start recording
-pai-stt stop      # Stop recording
+pai-stt toggle        # Start a live recording, or stop the running one (bind to a shortcut)
+pai-stt toggle-batch  # Start a batch recording, or stop the running one (a second shortcut)
+pai-stt status        # Check if daemon is running
+pai-stt start         # Start a live recording
+pai-stt start-batch   # Start a batch recording
+pai-stt stop          # Stop recording
 
 pai-stt recordings               # List past recordings, newest first
 pai-stt transcript <id|last>     # Print a past recording's transcript
 pai-stt retranscribe <id|last>   # Transcribe a past recording again via the backend
 ```
+
+Either toggle stops a running recording, whichever mode it was started in. A batch take's text
+reaches the clipboard once the backend has transcribed it, a few seconds to a minute after stop
+depending on its length.
 
 Recordings live in `~/.local/share/pai-stt/recordings/` as a 16 kHz WAV plus a JSON sidecar
 each; an id is the full take id or any unique prefix.
@@ -62,8 +72,11 @@ each; an id is the full take id or any unique prefix.
 
 ## GNOME Extension
 
-Shows recording status in the top panel, a scrollable popup with the full text, a copy button and
-the clipboard service described below.
+Shows recording status in the top panel and provides the clipboard service described below. The
+popup holds the full text, copy and start/stop items, and the recent recordings with their start
+time, length and mode: clicking one copies its transcript, its button transcribes it again. The
+icon stays in the panel between recordings (`show-when-idle`, in the extension's preferences) and
+turns grey when the daemon is not running or the microphone delivers no signal.
 
 ```bash
 pai-stt install-extension     # From the repo folder; log out/in on Wayland to load new code
