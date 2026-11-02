@@ -12,5 +12,10 @@
       <summary>Show the indicator when idle</summary>
       <description>Keep the microphone icon in the panel between recordings, so the menu and the recordings list stay reachable</description>
     </key>
+    <key name="expected-microphone" type="s">
+      <default>""</default>
+      <summary>Expected microphone</summary>
+      <description>Text the default microphone's name or description has to contain; a warning shows next to the icon otherwise. Empty turns the warning off</description>
+    </key>
   </schema>
 </schemalist>

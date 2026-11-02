@@ -12,6 +12,9 @@
  * - transcribing: Yellow icon + elapsed seconds
  * - done / empty / partial / error: Result label, back to idle after 5 seconds
  *
+ * An orange warning sits left of the icon while the default microphone is not the one named by the
+ * "expected-microphone" setting.
+ *
  * Click opens a popup with the full text, copy and start/stop items, and the list of past
  * recordings, each of which can be copied or transcribed again.
  *
@@ -23,6 +26,7 @@ import Clutter from "gi://Clutter";
 import GLib from "gi://GLib";
 import Gio from "gi://Gio";
 import GObject from "gi://GObject";
+import Gvc from "gi://Gvc";
 import Pango from "gi://Pango";
 import St from "gi://St";
 
@@ -30,6 +34,7 @@ import { Extension } from "resource:///org/gnome/shell/extensions/extension.js";
 import * as Main from "resource:///org/gnome/shell/ui/main.js";
 import * as PanelMenu from "resource:///org/gnome/shell/ui/panelMenu.js";
 import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
+import * as Volume from "resource:///org/gnome/shell/ui/status/volume.js";
 
 // DBus configuration - must match daemon
 const DBUS_NAME = "com.github.frederikb.PaiStt";
@@ -243,6 +248,13 @@ const PaiSttIndicator = GObject.registerClass(
         style_class: "system-status-icon",
       });
       this._icon.set_pivot_point(0.5, 0.5);
+      this._micWarning = new St.Icon({
+        icon_name: "dialog-warning-symbolic",
+        style_class: "pai-stt-mic-warning",
+        y_align: Clutter.ActorAlign.CENTER,
+        visible: false,
+      });
+      this._box.add_child(this._micWarning);
       this._box.add_child(this._icon);
 
       // Label for transcription preview. Ellipsizes from the START so the panel always shows
@@ -269,10 +281,33 @@ const PaiSttIndicator = GObject.registerClass(
       this._settingsChangedIds = [
         this._settings.connect("changed::label-max-width", () => this._applyWidthSetting()),
         this._settings.connect("changed::show-when-idle", () => this._applyVisibility()),
+        this._settings.connect("changed::expected-microphone", () => this._updateMicWarning()),
+      ];
+
+      this._mixer = Volume.getMixerControl();
+      this._mixerSignalIds = [
+        this._mixer.connect("state-changed", () => this._updateMicWarning()),
+        this._mixer.connect("default-source-changed", () => this._updateMicWarning()),
       ];
 
       this._buildMenu();
       this._updateState("offline", "", "live");
+      this._updateMicWarning();
+    }
+
+    /**
+     * Warn unless the default microphone's name or description contains the expected text.
+     */
+    _updateMicWarning() {
+      const expected = this._settings.get_string("expected-microphone").trim().toLowerCase();
+      let warn = false;
+      if (expected && this._mixer.get_state() === Gvc.MixerControlState.READY) {
+        const source = this._mixer.get_default_source();
+        const names = source ? [source.get_name(), source.get_description()] : [];
+        warn = !names.some((name) => name?.toLowerCase().includes(expected));
+      }
+      this._micWarning.visible = warn;
+      this._applyVisibility();
     }
 
     /**
@@ -291,7 +326,8 @@ const PaiSttIndicator = GObject.registerClass(
 
     _applyVisibility() {
       const resting = this._state === "idle" || this._state === "offline";
-      this.visible = !resting || this._settings.get_boolean("show-when-idle");
+      this.visible =
+        !resting || this._micWarning.visible || this._settings.get_boolean("show-when-idle");
     }
 
     /**
@@ -865,6 +901,11 @@ const PaiSttIndicator = GObject.registerClass(
         this._settings.disconnect(id);
       }
       this._settingsChangedIds = [];
+
+      for (const id of this._mixerSignalIds) {
+        this._mixer.disconnect(id);
+      }
+      this._mixerSignalIds = [];
 
       super.destroy();
     }

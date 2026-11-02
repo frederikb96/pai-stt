@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Added
+
+- GNOME indicator: an orange warning next to the icon while the default microphone does not match
+  the new `expected-microphone` setting. Empty by default, which turns it off.
+
 ## [0.4.0] - 2026-10-22
 
 ### Changed

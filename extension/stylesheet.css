@@ -35,6 +35,13 @@
   color: #8a8a8a;
 }
 
+/* Default microphone is not the expected one */
+.pai-stt-mic-warning {
+  icon-size: 16px;
+  margin-right: 4px;
+  color: #ffa94d;
+}
+
 /* Level history of a batch take; bars are drawn in this colour */
 .pai-stt-wave {
   margin-left: 6px;

@@ -52,5 +52,20 @@ export default class PaiSttPreferences extends ExtensionPreferences {
     });
     appearanceGroup.add(idleRow);
     settings.bind("show-when-idle", idleRow, "active", Gio.SettingsBindFlags.DEFAULT);
+
+    const microphoneGroup = new Adw.PreferencesGroup({
+      title: "Microphone",
+      description: "Show a warning unless the default microphone's name contains this text",
+    });
+    page.add(microphoneGroup);
+
+    const microphoneRow = new Adw.EntryRow({ title: "Expected Microphone" });
+    microphoneGroup.add(microphoneRow);
+    settings.bind(
+      "expected-microphone",
+      microphoneRow,
+      "text",
+      Gio.SettingsBindFlags.DEFAULT
+    );
   }
 }

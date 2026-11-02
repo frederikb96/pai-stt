@@ -78,7 +78,9 @@ Shows recording status in the top panel and provides the clipboard service descr
 popup holds the full text, copy and start/stop items, and the recent recordings with their start
 time, length and mode: clicking one copies its transcript, its button transcribes it again. The
 icon stays in the panel between recordings (`show-when-idle`, in the extension's preferences) and
-turns grey when the daemon is not running or the microphone delivers no signal.
+turns grey when the daemon is not running or the microphone delivers no signal. Set
+`expected-microphone` in the preferences to part of a microphone's name, and an orange warning sits
+next to the icon whenever a different one is the default input.
 
 ```bash
 pai-stt install-extension     # From the repo folder; log out/in on Wayland to load new code
