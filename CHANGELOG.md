@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-04
+
 ### Changed
 
 - The silence gate applies to batch takes too. Batch transcription is billed for every second of
