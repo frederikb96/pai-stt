@@ -21,8 +21,9 @@ worth reading and reusing, and because a public repository gets unmetered CI.
 - GNOME panel indicator with full-text popup; the live line always shows the end of the transcript,
   the recording dot pulses with the microphone level, and a batch take shows its elapsed time and a
   scrolling level history
-- Client-side silence gate: after a quiet stretch audio stops being sent (the backend keeps the
-  session open); the last second is sent first when speech resumes. Auto mode adapts to the room.
+- Client-side silence gate, in both modes: after a quiet stretch audio stops being sent (the
+  backend keeps the session open); the last second is sent first when speech resumes. Auto mode
+  adapts to the room.
 - Stop waits for the backend's receipt that the take is finished, so the last words arrive
 - A dropped connection is retried for as long as the recording runs and once more at stop;
   unacknowledged and queued audio is sent again. Audio the live text missed during a longer

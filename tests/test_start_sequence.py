@@ -14,6 +14,11 @@ from pai_stt import recordings, takes
 from pai_stt.daemon import CHUNK_BYTES, PaiSttDaemon, State
 from pai_stt.voice_client import TakeDone
 
+#: 100 ms of speech-loud audio, and 100 ms of a soft onset (about -55 dBFS) that a
+#: gate withholding a silent room keeps in its ring rather than resuming on.
+SPEECH = struct.pack("<1600h", *([8000, -8000] * 800))
+SOFT = struct.pack("<1600h", *([60, -60] * 800))
+
 
 class LivePwRecord:
     """A pw-record the test feeds by hand."""
@@ -87,7 +92,11 @@ class DaemonHarness(unittest.IsolatedAsyncioTestCase):
         self.spawned: list[list[str]] = []
 
     async def _start(
-        self, voice: Optional[SlowVoice], gain_db: float = 0, mode: str = "live"
+        self,
+        voice: Optional[SlowVoice],
+        gain_db: float = 0,
+        mode: str = "live",
+        gate: bool = False,
     ) -> PaiSttDaemon:
         """Start a take; `voice` None makes any voice socket the daemon creates an error."""
         self.copied: list[str] = []
@@ -103,7 +112,7 @@ class DaemonHarness(unittest.IsolatedAsyncioTestCase):
                 "transcription_timeout": 5,
                 "token_command": "sh -c 'printf fake-token'" if voice else "false",
                 "pai_cloud": {"socket_url": "wss://example/socket"},
-                "silence_gate": {"enabled": False, "mode": "auto", "manual_threshold_db": -45},
+                "silence_gate": {"enabled": gate, "mode": "auto", "manual_threshold_db": -45},
                 "capture": {"gain_db": gain_db},
             }
         )
@@ -402,6 +411,40 @@ class TestBatchTake(DaemonHarness):
         self.assertTrue(reply.startswith("OK"), reply)
         self.assertEqual(daemon.state, State.IDLE)
         self.assertIn("close_gate", voice.calls)
+
+    async def _gated_batch(self) -> tuple[PaiSttDaemon, BatchVoice]:
+        """A batch take with the gate on: a second of speech, then quiet until
+        the gate withholds."""
+        voice, server = BatchVoice(fail=False), FakeTakes()
+        voice.silence_allowed = True
+        daemon = await self._start(voice, mode="batch", gate=True)
+        daemon._take_client = lambda: server  # type: ignore[assignment, method-assign, return-value]
+        for chunk in [SPEECH] * 10 + [bytes(CHUNK_BYTES)] * 80:
+            self.pw.stdout.feed_data(chunk)
+            await self._settle()
+        self.assertIn("silence", voice.calls)
+        server.captured = 91 * CHUNK_BYTES // 2
+        server.received = [(0, server.captured)]
+        return daemon, voice
+
+    async def test_a_batch_take_withholds_its_quiet_and_seals_all_it_captured(self) -> None:
+        daemon, voice = await self._gated_batch()
+        await self._stop(daemon)
+        self.assertLess(len(voice.sent), 90)
+        self.assertEqual(voice.sealed_at, 90 * CHUNK_BYTES // 2)
+        self.assertEqual(self.copied, ["server words"])
+
+    async def test_speech_the_gate_still_holds_at_stop_is_sent_before_the_seal(self) -> None:
+        daemon, voice = await self._gated_batch()
+        self.pw.stdout.feed_data(SOFT)
+        await self._settle()
+        self.assertNotEqual(voice.sent[-1], SOFT)
+        await self._stop(daemon)
+        self.assertEqual(voice.sent[-1], SOFT)
+        self.assertLess(
+            max(i for i, c in enumerate(voice.calls) if c.startswith("audio")),
+            voice.calls.index("close_gate"),
+        )
 
     async def test_the_recording_being_written_cannot_be_retranscribed(self) -> None:
         daemon = await self._record_batch(BatchVoice(fail=False), FakeTakes(), chunks=1)

@@ -714,9 +714,9 @@ class PaiSttDaemon:
         RESULT_SYMLINK.symlink_to(self.current_output_file)
 
         gate_config = self.config["silence_gate"]
-        # A batch take bills nothing while it records, so all of it is sent: the
-        # backend then holds the whole take and finds pauses in the audio itself.
-        gate_enabled = gate_config["enabled"] and mode == "live"
+        # Batch transcription is billed per second of audio sent, quiet included,
+        # so a batch take withholds silence like a live one.
+        gate_enabled = gate_config["enabled"]
         self._gate = SilenceGate(
             enabled=gate_enabled,
             mode=gate_config["mode"],
@@ -964,6 +964,9 @@ class PaiSttDaemon:
         voice = self.voice if self._uplink_ready and self._uplink_ok else None
         sealed = False
         if voice is not None and take_id:
+            if self._gate:
+                # Speech in the withheld ring would otherwise be sealed as withheld.
+                await self._send(self._gate.stop_flush())
             try:
                 await voice.close_gate("button", take_id=take_id, captured_samples=captured)
                 sealed = await voice.wait_take_state(take_id, SEAL_WAIT_S) is not None
