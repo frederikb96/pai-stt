@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-07
+
 ### Changed
 
 - DBus goes through `dbus-fast` instead of the unmaintained `dbus-next`, which no longer imports
