@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Changed
+
+- DBus goes through `dbus-fast` instead of the unmaintained `dbus-next`, which no longer imports
+  on Python 3.15. The DBus interface is unchanged.
+- CI runs on Python 3.15 and Node 26.
+
 ## [0.6.0] - 2026-11-04
 
 ### Changed
