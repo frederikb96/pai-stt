@@ -56,9 +56,9 @@ from pai_stt.silence_gate import Frame, SilenceGate, level_db
 from pai_stt.voice_client import VoiceSocketCallbacks, VoiceSocketClient
 
 try:
-    from dbus_next.aio import MessageBus
-    from dbus_next.service import ServiceInterface, method
-    from dbus_next.service import signal as dbus_signal
+    from dbus_fast.aio import MessageBus
+    from dbus_fast.service import ServiceInterface, method
+    from dbus_fast.service import signal as dbus_signal
 
     DBUS_AVAILABLE = True
 except ImportError:
@@ -235,7 +235,7 @@ if DBUS_AVAILABLE:
             self._signal_text = ""
             self._mode = "live"
 
-        # dbus_next reads its DBus signature straight off these string
+        # dbus_fast reads its DBus signature straight off these string
         # annotations ("ss" = two strings, "b" = one boolean) rather than a
         # real Python type, which is why ruff and mypy both misread them as
         # undefined names.
@@ -337,7 +337,7 @@ class PaiSttDaemon:
     async def setup_dbus(self) -> None:
         """Set up the DBus service the GNOME extension talks to."""
         if not DBUS_AVAILABLE:
-            logger.info("DBus not available (dbus-next not installed)")
+            logger.info("DBus not available (dbus-fast not installed)")
             return
         try:
             self.dbus_bus = await MessageBus().connect()
