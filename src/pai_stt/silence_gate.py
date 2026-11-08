@@ -26,7 +26,10 @@ FLOOR_WINDOW_MS = 8000
 FLOOR_PERCENTILE = 10
 FLOOR_MIN_HISTORY_MS = 1000
 AUTO_MARGIN_DB = 8.0
-AUTO_OPEN_MIN_DB = -60.0
+# Below about -80 dBFS a 100 ms frame of 16-bit audio is a few least-significant
+# bits, rounding rather than sound; a higher floor holds back a distant or
+# whispering voice, which reaches the microphone at -55 to -70 dBFS.
+AUTO_OPEN_MIN_DB = -80.0
 AUTO_MAX_FLOOR_DB = -50.0
 HYSTERESIS_DB = 3.0
 ONSET_MS = 150

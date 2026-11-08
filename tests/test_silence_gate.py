@@ -2,8 +2,8 @@
 
 The same vector table runs in the iOS and web clients. Frames alternate +A/-A
 with A = round(32768 * 10^(dB/20)). Auto mode derives its open threshold from
-the tracked noise floor, never below -60 dBFS, so a quiet room (-75) opens at
--60 and closes at -63; a frame only counts as quiet there if it is also below
+the tracked noise floor, never below -80 dBFS, so a quiet room (-75) opens at
+-67 and closes at -70; a frame only counts as quiet there if it is also below
 -50 dBFS.
 """
 
@@ -87,7 +87,7 @@ class TestGateVectors(unittest.TestCase):
         run.push(-40, 30)
         run.push(-75, 60)
         self.assertTrue(run.gate.is_withholding)
-        sent = [f for r in (run.push(-56), run.push(-75, 5)) for f in r.send]
+        sent = [f for r in (run.push(-60), run.push(-75, 5)) for f in r.send]
         self.assertEqual(sent, [])
         self.assertTrue(run.gate.is_withholding)
 
@@ -97,6 +97,14 @@ class TestGateVectors(unittest.TestCase):
         run.push(-75, 60)
         self.assertTrue(run.gate.is_withholding)
         run.push(-48)
+        self.assertFalse(run.gate.is_withholding)
+
+    def test_v8_a_distant_voice_in_a_near_silent_room_resumes(self) -> None:
+        # A microphone far from the speaker: the room near -95, speech at -70.
+        run = auto()
+        run.push(-95, 120)
+        self.assertTrue(run.gate.is_withholding)
+        run.push(-70, 2)
         self.assertFalse(run.gate.is_withholding)
 
     def test_v5_manual_threshold(self) -> None:
