@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Fixed
+
+- The silence gate in auto mode hears a distant or whispering voice again: its open threshold no
+  longer stops at -60 dBFS but follows the room down to -80 dBFS, so speech arriving around
+  -65 dBFS ends a withheld stretch instead of being held back.
+
 ## [0.6.1] - 2026-11-07
 
 ### Changed
