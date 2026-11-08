@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-08
+
 ### Fixed
 
 - The silence gate in auto mode hears a distant or whispering voice again: its open threshold no
