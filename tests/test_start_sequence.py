@@ -14,7 +14,7 @@ from pai_stt import recordings, takes
 from pai_stt.daemon import CHUNK_BYTES, PaiSttDaemon, State
 from pai_stt.voice_client import TakeDone
 
-#: 100 ms of speech-loud audio, and 100 ms of a soft onset (about -55 dBFS) that a
+#: 100 ms of speech-loud audio, and 100 ms of a soft onset (about -76 dBFS) that a
 #: gate withholding a silent room keeps in its ring rather than resuming on.
 SPEECH = struct.pack("<1600h", *([8000, -8000] * 800))
 SOFT = struct.pack("<1600h", *([5, -5] * 800))
