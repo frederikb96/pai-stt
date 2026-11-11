@@ -38,8 +38,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/frederikb96/pai-stt"
-Repository = "https://github.com/frederikb96/pai-stt"
+Homepage = "https://github.com/frederikberg/pai-stt"
+Repository = "https://github.com/frederikberg/pai-stt"
 
 [project.scripts]
 pai-stt = "pai_stt.cli:main"
