@@ -4,6 +4,6 @@
   "uuid": "pai-stt@frederikb.github.com",
   "version": 4,
   "shell-version": ["46", "47", "48", "49", "50"],
-  "url": "https://github.com/frederikb96/pai-stt",
+  "url": "https://github.com/frederikberg/pai-stt",
   "settings-schema": "org.gnome.shell.extensions.pai-stt"
 }

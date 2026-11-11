@@ -1,6 +1,6 @@
 # PAI STT
 
-[![CI](https://github.com/frederikb96/pai-stt/actions/workflows/ci.yaml/badge.svg)](https://github.com/frederikb96/pai-stt/actions/workflows/ci.yaml)
+[![CI](https://github.com/frederikberg/pai-stt/actions/workflows/ci.yaml/badge.svg)](https://github.com/frederikberg/pai-stt/actions/workflows/ci.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Real-time dictation for Linux, streamed to a PAI Cloud backend over a WebSocket. Runs as a
@@ -37,7 +37,7 @@ worth reading and reusing, and because a public repository gets unmetered CI.
 Requires Python 3.11+, PipeWire, and wl-clipboard (Wayland).
 
 ```bash
-pipx install git+https://github.com/frederikb96/pai-stt.git
+pipx install git+https://github.com/frederikberg/pai-stt.git
 pai-stt setup
 ```
 
