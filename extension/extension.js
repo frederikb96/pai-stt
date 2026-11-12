@@ -15,6 +15,9 @@
  * An orange warning sits left of the icon while the default microphone is not the one named by the
  * "expected-microphone" setting.
  *
+ * With "show-other-recordings" on, a red microphone and a scrolling level history show while the
+ * daemon rests and another application records.
+ *
  * Click opens a popup with the full text, copy and start/stop items, and the list of past
  * recordings, each of which can be copied or transcribed again.
  *
@@ -97,6 +100,26 @@ const NO_SIGNAL_MS = 3000;
 // One bar of the level history per chunk: bar width plus gap, in pixels.
 const WAVE_STEP_PX = 3;
 
+// Recording streams that are not an application listening: GNOME's own two level meters (skipped
+// by its privacy indicator the same way) and the daemon's capture, which the indicator shows itself.
+const NOT_RECORDING_APPS = ["org.gnome.VolumeControl", "org.PulseAudio.pavucontrol", DBUS_NAME];
+// The level meter reads the default microphone as GNOME's volume control, so neither GNOME's
+// privacy indicator nor the check above counts it as a recording.
+const METER_COMMAND = [
+  "pw-record",
+  "--rate",
+  "16000",
+  "--format",
+  "s16",
+  "--channels",
+  "1",
+  "--raw",
+  "--properties",
+  '{ application.id = "org.gnome.VolumeControl" }',
+  "-",
+];
+const METER_CHUNK_SAMPLES = 1600;
+
 /**
  * DBus service letting the daemon hand text to the Shell's own clipboard.
  */
@@ -178,6 +201,44 @@ const ViewToggleItem = GObject.registerClass(
   }
 );
 
+/**
+ * Turns the meter's PCM16 stream into one dBFS value per chunk, computed like the daemon's own.
+ */
+class LevelMeter {
+  constructor(onLevel) {
+    this._onLevel = onLevel;
+    this._carry = null;
+    this._sum = 0;
+    this._count = 0;
+  }
+
+  feed(data) {
+    let bytes = data;
+    if (this._carry !== null) {
+      bytes = new Uint8Array(data.length + 1);
+      bytes[0] = this._carry;
+      bytes.set(data, 1);
+      this._carry = null;
+    }
+    const even = bytes.length - (bytes.length % 2);
+    if (even < bytes.length) {
+      this._carry = bytes[even];
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, even);
+    for (let i = 0; i < even; i += 2) {
+      const sample = view.getInt16(i, true);
+      this._sum += sample * sample;
+      this._count++;
+      if (this._count === METER_CHUNK_SAMPLES) {
+        const rms = Math.sqrt(this._sum / this._count);
+        this._onLevel(20 * Math.log10(Math.max(rms / 32768, 1e-5)));
+        this._sum = 0;
+        this._count = 0;
+      }
+    }
+  }
+}
+
 function clamp01(value) {
   return Math.min(1, Math.max(0, value));
 }
@@ -234,6 +295,9 @@ const PaiSttIndicator = GObject.registerClass(
       this._lastSignal = 0;
       this._noSignal = false;
       this._wave = [];
+      this._external = false;
+      this._meterProc = null;
+      this._meterCancel = null;
       this._dbusSignalIds = [];
       this._nameWatchId = null;
 
@@ -282,12 +346,16 @@ const PaiSttIndicator = GObject.registerClass(
         this._settings.connect("changed::label-max-width", () => this._applyWidthSetting()),
         this._settings.connect("changed::show-when-idle", () => this._applyVisibility()),
         this._settings.connect("changed::expected-microphone", () => this._updateMicWarning()),
+        this._settings.connect("changed::show-other-recordings", () => this._updateExternal()),
       ];
 
       this._mixer = Volume.getMixerControl();
       this._mixerSignalIds = [
         this._mixer.connect("state-changed", () => this._updateMicWarning()),
+        this._mixer.connect("state-changed", () => this._updateExternal()),
         this._mixer.connect("default-source-changed", () => this._updateMicWarning()),
+        this._mixer.connect("stream-added", () => this._updateExternal()),
+        this._mixer.connect("stream-removed", () => this._updateExternal()),
       ];
 
       this._buildMenu();
@@ -311,6 +379,81 @@ const PaiSttIndicator = GObject.registerClass(
     }
 
     /**
+     * Show another application's recording while the daemon rests, with the meter's level.
+     */
+    _updateExternal() {
+      const resting = this._state === "idle" || this._state === "offline";
+      const active =
+        resting &&
+        this._settings.get_boolean("show-other-recordings") &&
+        this._mixer.get_state() === Gvc.MixerControlState.READY &&
+        this._mixer
+          .get_source_outputs()
+          .some((output) => !NOT_RECORDING_APPS.includes(output.get_application_id()));
+
+      if (active) {
+        this._box.add_style_class_name("external");
+        this._icon.set_icon_name(ICONS.idle);
+        this._waveArea.visible = true;
+        if (!this._external) {
+          this._wave = [];
+          this._waveArea.queue_repaint();
+          this._startMeter();
+        }
+      } else if (this._external) {
+        this._stopMeter();
+        this._box.remove_style_class_name("external");
+        if (resting) {
+          this._resetPulse();
+          this._waveArea.visible = false;
+        }
+      }
+      this._external = active;
+      this._applyVisibility();
+    }
+
+    _startMeter() {
+      try {
+        this._meterProc = Gio.Subprocess.new(
+          METER_COMMAND,
+          Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
+        );
+      } catch (e) {
+        log(`[pai-stt] Level meter failed to start: ${e.message}`);
+        return;
+      }
+      this._meterCancel = new Gio.Cancellable();
+      const meter = new LevelMeter((db) => this._showLevel(db, true));
+      this._readMeter(this._meterProc.get_stdout_pipe(), meter, this._meterCancel);
+    }
+
+    _readMeter(stream, meter, cancel) {
+      stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, cancel, (source, result) => {
+        let bytes;
+        try {
+          bytes = source.read_bytes_finish(result);
+        } catch (e) {
+          if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+            log(`[pai-stt] Level meter read failed: ${e.message}`);
+          }
+          return;
+        }
+        if (bytes.get_size() === 0) {
+          return;
+        }
+        meter.feed(bytes.toArray());
+        this._readMeter(source, meter, cancel);
+      });
+    }
+
+    _stopMeter() {
+      this._meterCancel?.cancel();
+      this._meterCancel = null;
+      this._meterProc?.force_exit();
+      this._meterProc = null;
+    }
+
+    /**
      * Apply width setting to label and level history (only max-width is dynamic).
      */
     _applyWidthSetting() {
@@ -327,7 +470,10 @@ const PaiSttIndicator = GObject.registerClass(
     _applyVisibility() {
       const resting = this._state === "idle" || this._state === "offline";
       this.visible =
-        !resting || this._micWarning.visible || this._settings.get_boolean("show-when-idle");
+        !resting ||
+        this._external ||
+        this._micWarning.visible ||
+        this._settings.get_boolean("show-when-idle");
     }
 
     /**
@@ -702,16 +848,7 @@ const PaiSttIndicator = GObject.registerClass(
         return;
       }
       const [db] = params.recursiveUnpack();
-      const level = clamp01((db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB));
-      // Rises at once, falls off over a few chunks, so syllables read as pulses.
-      this._level = Math.max(level, this._level * 0.6);
-      this._icon.ease({
-        scale_x: 0.8 + 0.45 * this._level,
-        scale_y: 0.8 + 0.45 * this._level,
-        opacity: 130 + Math.round(125 * this._level),
-        duration: 100,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-      });
+      this._showLevel(db, this._mode === "batch");
 
       const now = GLib.get_monotonic_time() / 1000;
       if (db > NO_SIGNAL_DB) {
@@ -727,8 +864,24 @@ const PaiSttIndicator = GObject.registerClass(
         }
         this._renderRecordingLabel();
       }
+    }
 
-      if (this._mode === "batch") {
+    /**
+     * Pulse the icon with one chunk's level and, with `history`, add it to the level history.
+     */
+    _showLevel(db, history) {
+      const level = clamp01((db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB));
+      // Rises at once, falls off over a few chunks, so syllables read as pulses.
+      this._level = Math.max(level, this._level * 0.6);
+      this._icon.ease({
+        scale_x: 0.8 + 0.45 * this._level,
+        scale_y: 0.8 + 0.45 * this._level,
+        opacity: 130 + Math.round(125 * this._level),
+        duration: 100,
+        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      });
+
+      if (history) {
         this._wave.push(level);
         const keep = Math.ceil(this._waveArea.width / WAVE_STEP_PX) + 1;
         if (this._wave.length > keep) {
@@ -865,6 +1018,7 @@ const PaiSttIndicator = GObject.registerClass(
       if (this.menu.isOpen) {
         this._refreshPopup();
       }
+      this._updateExternal();
     }
 
     /**
@@ -894,6 +1048,7 @@ const PaiSttIndicator = GObject.registerClass(
     destroy() {
       this._clearResetTimeout();
       this._stopTicking();
+      this._stopMeter();
       this.disconnectDbus();
       this._icon.remove_all_transitions();
 

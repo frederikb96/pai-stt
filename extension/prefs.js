@@ -53,6 +53,13 @@ export default class PaiSttPreferences extends ExtensionPreferences {
     appearanceGroup.add(idleRow);
     settings.bind("show-when-idle", idleRow, "active", Gio.SettingsBindFlags.DEFAULT);
 
+    const otherRow = new Adw.SwitchRow({
+      title: "Show Other Recordings",
+      subtitle: "Red microphone and input level while another app records",
+    });
+    appearanceGroup.add(otherRow);
+    settings.bind("show-other-recordings", otherRow, "active", Gio.SettingsBindFlags.DEFAULT);
+
     const microphoneGroup = new Adw.PreferencesGroup({
       title: "Microphone",
       description: "Show a warning unless the default microphone's name contains this text",

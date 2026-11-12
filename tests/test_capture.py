@@ -20,6 +20,11 @@ class TestCaptureCommand(unittest.TestCase):
         self.assertNotIn("--raw", command)
         self.assertEqual(command[-1], "-")
 
+    def test_stream_carries_the_dbus_name_as_application_id(self) -> None:
+        command = daemon_module.capture_command()
+        properties = command[command.index("--properties") + 1]
+        self.assertEqual(properties, f'{{ application.id = "{daemon_module.DBUS_NAME}" }}')
+
     def test_support_is_read_from_the_help_text(self) -> None:
         daemon_module._pw_record_supports_raw.cache_clear()
         self.addCleanup(daemon_module._pw_record_supports_raw.cache_clear)

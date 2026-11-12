@@ -35,6 +35,11 @@
   color: #8a8a8a;
 }
 
+/* Another application records; after the resting states so it wins over offline's grey */
+.panel-status-menu-box.external .system-status-icon {
+  color: #ff6b6b;
+}
+
 /* Default microphone is not the expected one */
 .pai-stt-mic-warning {
   icon-size: 16px;
@@ -42,7 +47,7 @@
   color: #ffa94d;
 }
 
-/* Level history of a batch take; bars are drawn in this colour */
+/* Level history of a batch take or another app's recording; bars are drawn in this colour */
 .pai-stt-wave {
   margin-left: 6px;
   height: 16px;
