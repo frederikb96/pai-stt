@@ -81,7 +81,9 @@ time, length and mode: clicking one copies its transcript, its button transcribe
 icon stays in the panel between recordings (`show-when-idle`, in the extension's preferences) and
 turns grey when the daemon is not running or the microphone delivers no signal. Set
 `expected-microphone` in the preferences to part of a microphone's name, and an orange warning sits
-next to the icon whenever a different one is the default input.
+next to the icon whenever a different one is the default input. With `show-other-recordings` on,
+a red microphone and a scrolling level history of the default microphone show while another
+application records and the daemon does not.
 
 ```bash
 pai-stt install-extension     # From the repo folder; log out/in on Wayland to load new code

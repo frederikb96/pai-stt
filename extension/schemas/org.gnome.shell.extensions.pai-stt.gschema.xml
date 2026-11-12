@@ -17,5 +17,10 @@
       <summary>Expected microphone</summary>
       <description>Text the default microphone's name or description has to contain; a warning shows next to the icon otherwise. Empty turns the warning off</description>
     </key>
+    <key name="show-other-recordings" type="b">
+      <default>false</default>
+      <summary>Show other applications' recordings</summary>
+      <description>While the daemon is not recording and another application records audio, show a red microphone and the default microphone's level history</description>
+    </key>
   </schema>
 </schemalist>

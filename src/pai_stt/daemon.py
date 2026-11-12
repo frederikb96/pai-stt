@@ -153,7 +153,8 @@ def capture_command() -> list[str]:
 
     Newer PipeWire wraps stdout in an AU container header unless `--raw` is passed; the pump
     forwards every byte as audio, so the header would open each take with a click. Older
-    versions write bare samples to `-` already and do not know the flag.
+    versions write bare samples to `-` already and do not know the flag. The stream carries the
+    DBus name as its application id, so the extension can tell it from other apps' recordings.
     """
     command = [
         "pw-record",
@@ -163,6 +164,8 @@ def capture_command() -> list[str]:
         "s16",
         "--channels",
         "1",
+        "--properties",
+        f'{{ application.id = "{DBUS_NAME}" }}',
     ]
     if _pw_record_supports_raw():
         command.append("--raw")

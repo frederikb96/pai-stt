@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+### Added
+
+- `show-other-recordings` extension setting (off by default): while another application records
+  and the daemon does not, the panel shows a red microphone and a scrolling level history of the
+  default microphone. The daemon's capture stream carries the DBus name as its application id, so
+  the extension tells it apart from other recordings.
+
 ## [0.6.2] - 2026-11-08
 
 ### Fixed
