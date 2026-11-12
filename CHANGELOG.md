@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning follo
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-12
+
 ### Added
 
 - `show-other-recordings` extension setting (off by default): while another application records
